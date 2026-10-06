@@ -356,6 +356,15 @@ __global__ void argmax_kernel(const float* x, int n, int32_t* out) {
     if (threadIdx.x == 0) *out = bi[0];
 }
 
+__global__ void iota_kernel(int32_t* d, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = i;
+}
+__global__ void set_pair_kernel(int32_t* d, int32_t a, int32_t b) {
+    d[0] = a;
+    d[1] = b;
+}
+
 inline unsigned blocks(int n, int t) { return (unsigned) ((n + t - 1) / t); }
 
 }  // namespace
@@ -442,6 +451,14 @@ void axpy_dev(float* y, const float* x, const float* a_dev, int n, void* stream)
 void add_inplace(float* y, const float* x, int n, void* stream) {
     add_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(y, x, n);
     check("add_inplace");
+}
+void iota(int32_t* d, int n, void* stream) {
+    iota_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(d, n);
+    check("iota");
+}
+void set_pair(int32_t* d, int32_t a, int32_t b, void* stream) {
+    set_pair_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d, a, b);
+    check("set_pair");
 }
 void argmax(const float* x, int n, int32_t* out, void* stream) {
     argmax_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, n, out);

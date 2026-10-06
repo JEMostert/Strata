@@ -67,6 +67,10 @@ void swiglu_clamp(const float* g, const float* u, float* out, int n, float limit
 void axpy_dev(float* y, const float* x, const float* a_dev, int n, void* stream);
 /// y += x.
 void add_inplace(float* y, const float* x, int n, void* stream);
+/// d[i] = i for i < n.
+void iota(int32_t* d, int n, void* stream);
+/// d[0] = a, d[1] = b.
+void set_pair(int32_t* d, int32_t a, int32_t b, void* stream);
 /// Index of the largest of n floats into *out (device).
 void argmax(const float* x, int n, int32_t* out, void* stream);
 

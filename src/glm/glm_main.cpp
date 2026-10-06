@@ -8,6 +8,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/glm/glm_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -25,6 +26,7 @@
 
 namespace K = strata::kernels;
 namespace G = strata::glm;
+namespace Q = strata::prefill::mmq;
 
 namespace {
 
@@ -206,6 +208,56 @@ struct Model {
             for (const Ten* t : {&L.attn_norm, &L.hca_base, &L.hca_scale, &L.A, &L.dtb, &L.onorm, &L.cq, &L.qa_norm,
                                  &L.kva_norm, &L.ix_knw, &L.ix_knb, &L.ix_proj, &L.ix_ape, &L.router, &L.probs_b})
                 if (*t && t->type != 0) throw std::runtime_error("expected an f32 tensor in layer " + std::to_string(il));
+        }
+    }
+};
+
+// y (T rows, ld_y floats apart) = W x for T rows of x (ld_x floats apart): llama.cpp's MMQ (int8 tensor cores) when it
+// covers the type and shape, else the one-token MMVQ kernel per group of up to 8 columns.
+struct Gemm {
+    Q::Context ctx;
+    int32_t* ids = nullptr;
+    int32_t* bounds = nullptr;
+    void* xq = nullptr;
+    int64_t rows_cap = 0, cols_cap = 0;
+    float* pack = nullptr;   // contiguous copy for the fallback when ld_x != n_in
+
+    Gemm(int64_t rows, int64_t cols, cudaStream_t st) : rows_cap(rows), cols_cap(cols) {
+        ck(cudaMalloc(&ids, rows * sizeof(int32_t)), "gemm ids");
+        ck(cudaMalloc(&bounds, 2 * sizeof(int32_t)), "gemm bounds");
+        ck(cudaMalloc(&xq, std::max(Q::q8_bytes(rows, cols), K::native_q8_1_bytes((int) cols, 8))), "gemm xq");
+        ck(cudaMalloc(&pack, (size_t) 8 * cols * sizeof(float)), "gemm pack");
+        G::iota(ids, (int) rows, st);
+    }
+    static bool mmq_ok(int type, int64_t n_out) { return Q::built() && Q::supported(type) && Q::fits(type, n_out); }
+    void run(int type, const void* w, int64_t n_in, int64_t n_out, size_t wbytes, const float* x, int64_t ld_x,
+             int64_t T, float* y, int64_t ld_y, cudaStream_t st, bool force_mmvq = false) {
+        if (T > rows_cap || n_in > cols_cap) throw std::runtime_error("gemm: buffers too small");
+        if (!force_mmvq && T > 1 && mmq_ok(type, n_out)) {
+            G::set_pair(bounds, 0, (int32_t) T, st);
+            Q::quantize(x, nullptr, xq, type, n_in, ld_x, T, st);
+            Q::Product p;
+            p.w = w; p.type = type; p.w_rows = n_out; p.w_cols = n_in; p.expert_bytes = wbytes; p.n = 1;
+            p.xq = xq; p.bounds = bounds; p.ids = ids; p.total_rows = T; p.max_rows = T; p.dst = y; p.ld_dst = ld_y;
+            ctx.run(p, st);
+            return;
+        }
+        for (int64_t c0 = 0; c0 < T; c0 += 8) {
+            const int nc = (int) std::min<int64_t>(8, T - c0);
+            const float* xs = x + c0 * ld_x;
+            if (ld_x != n_in) {
+                ck(cudaMemcpy2DAsync(pack, n_in * sizeof(float), xs, ld_x * sizeof(float), n_in * sizeof(float), nc,
+                                     cudaMemcpyDeviceToDevice, st), "gemm pack");
+                xs = pack;
+            }
+            K::native_quantize_q8_1(xs, xq, (int) n_in, nc, st);
+            if (ld_y == n_out) {
+                K::native_mmvq(type, w, xq, y + c0 * ld_y, (int) n_in, (int) n_out, nc, st);
+            } else {
+                for (int c = 0; c < nc; ++c)
+                    K::native_mmvq(type, w, (const uint8_t*) xq + c * K::native_q8_1_bytes((int) n_in, 1),
+                                   y + (c0 + c) * ld_y, (int) n_in, (int) n_out, 1, st);
+            }
         }
     }
 };
@@ -448,6 +500,61 @@ struct Engine {
     }
 };
 
+// --selftest: every kind of weight GLM multiplies, MMQ (Gemm) against the one-token MMVQ path on random rows.
+int selftest(Model& M) {
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    const int64_t T = 37;
+    Gemm gm(T, 16384, st);
+    struct Case { const char* name; const Ten* t; size_t expert; };
+    const auto& L0 = M.layers[0];
+    const auto& L3 = M.layers[3];
+    const auto& L11 = M.layers[11];
+    std::vector<Case> cases = {{"kda q Q5_K", &L0.q, 0}, {"kda wo Q5_K", &L0.wo, 0}, {"f_a Q8_0", &L0.fa, 0},
+                               {"f_b Q8_0", &L0.fb, 0}, {"beta Q8_0", &L0.beta, 0}, {"hc_fn Q8_0", &L0.hca_fn, 0},
+                               {"ffn_down Q6_K", &L0.fd, 0}, {"ffn_gate Q5_K", &L0.fg, 0}, {"q_a Q5_K", &L3.qa, 0},
+                               {"q_b Q8_0", &L3.qb, 0}, {"kv_a Q8_0", &L3.kva, 0}, {"ix_q_b Q8_0", &L3.ix_qb, 0},
+                               {"mla wo Q5_K", &L3.wo, 0}, {"shexp down Q6_K", &L3.sd, 0}, {"output Q4_K", &M.output, 0},
+                               {"exp gate IQ2_XXS", &L3.eg, 1}, {"exp down IQ3_XXS", &L3.ed, 1},
+                               {"exp gate IQ2_S", &L11.eg, 1}, {"exp down IQ4_XS", &L11.ed, 1}};
+    int bad = 0;
+    for (const auto& c : cases) {
+        const Ten& t = *c.t;
+        const int64_t n_in = (int64_t) t.shape[0], n_out = (int64_t) t.shape[1];
+        const void* w = t.d;
+        void* tmp = nullptr;
+        size_t wb = t.bytes;
+        if (c.expert) {   // one expert's slice copied to the device
+            wb = t.bytes / M.n_expert;
+            ck(cudaMalloc(&tmp, wb), "expert");
+            ck(cudaMemcpy(tmp, t.host + 5 * wb, wb, cudaMemcpyHostToDevice), "expert copy");
+            w = tmp;
+        }
+        std::vector<float> hx((size_t) T * n_in);
+        uint32_t seed = 12345;
+        for (auto& v : hx) { seed = seed * 1664525u + 1013904223u; v = ((seed >> 8) / 16777216.0f - 0.5f) * 2.0f; }
+        float *x = dalloc(hx.size()), *y1 = dalloc((size_t) T * n_out), *y2 = dalloc((size_t) T * n_out);
+        ck(cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice), "x");
+        gm.run(t.type, w, n_in, n_out, wb, x, n_in, T, y1, n_out, st, false);
+        gm.run(t.type, w, n_in, n_out, wb, x, n_in, T, y2, n_out, st, true);
+        ck(cudaStreamSynchronize(st), "selftest");
+        std::vector<float> a((size_t) T * n_out), b(a.size());
+        ck(cudaMemcpy(a.data(), y1, a.size() * 4, cudaMemcpyDeviceToHost), "y1");
+        ck(cudaMemcpy(b.data(), y2, b.size() * 4, cudaMemcpyDeviceToHost), "y2");
+        double md = 0, mx = 0;
+        for (size_t i = 0; i < a.size(); ++i) { md = std::max(md, (double) std::fabs(a[i] - b[i])); mx = std::max(mx, (double) std::fabs(b[i])); }
+        const bool mmq = Gemm::mmq_ok(t.type, n_out);
+        const bool ok = std::isfinite(md) && md <= 2e-2 * std::max(mx, 1e-3);
+        std::printf("  %-18s %6lld x %6lld  %s  max |diff| %.3g of max |y| %.3g  %s\n", c.name, (long long) n_out,
+                    (long long) n_in, mmq ? "MMQ " : "MMVQ", md, mx, ok ? "ok" : "MISMATCH");
+        bad += !ok;
+        cudaFree(x); cudaFree(y1); cudaFree(y2);
+        if (tmp) cudaFree(tmp);
+    }
+    std::printf("selftest: %d mismatches\n", bad);
+    return bad ? 1 : 0;
+}
+
 std::vector<int32_t> parse_ids(const std::string& s) {
     std::vector<int32_t> v;
     size_t i = 0;
@@ -466,7 +573,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string model, tokens;
     int max_new = 8, ctx = 4096, top = 5;
-    bool dump = false;
+    bool dump = false, self = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -479,9 +586,10 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::stoi(next());
         else if (a == "--top") top = std::stoi(next());
         else if (a == "--dump") dump = true;
+        else if (a == "--selftest") self = true;
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return 2; }
     }
-    if (model.empty() || tokens.empty()) {
+    if (model.empty() || (tokens.empty() && !self)) {
         std::fprintf(stderr, "usage: strata-glm --model <GGUF shard 1> --tokens 1,2,3 [--max-new N] [--ctx N] [--top K] [--dump]\n");
         return 2;
     }
@@ -495,6 +603,7 @@ int main(int argc, char** argv) {
                     (int) std::count_if(M.layers.begin(), M.layers.end(), [](const Model::Layer& L) { return L.mla; }),
                     M.n_embd, M.n_expert, M.n_used, M.n_vocab, M.vram_weights / 1073741824.0,
                     std::chrono::duration<double>(clk::now() - t0).count());
+        if (self) return selftest(M);
         Engine E(M, ctx);
         E.dump = dump;
         const std::vector<int32_t> prompt = parse_ids(tokens);

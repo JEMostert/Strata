@@ -536,7 +536,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA)
     add_executable(strata-glm src/glm/glm_main.cpp src/glm/glm_kernels.cu)
     target_include_directories(strata-glm PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(strata-glm PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    target_link_libraries(strata-glm PRIVATE strata_prefill ${_strata_gpu_runtime_target})
   endif()
 
   if(STRATA_ENABLE_HIP)
