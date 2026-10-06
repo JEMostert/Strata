@@ -7,26 +7,36 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/glm/glm_kernels.hpp"
+#include "strata/kernels/cpu/glu.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace K = strata::kernels;
 namespace G = strata::glm;
 namespace Q = strata::prefill::mmq;
+namespace C = strata::kernels::cpu;
 
 namespace {
 
@@ -262,6 +272,140 @@ struct Gemm {
     }
 };
 
+// ---- the GLM expert pack: <dir>/experts.bin, every MoE layer's experts as contiguous [gate | up | down] blobs (the
+// GGUF bytes of the three slices, back to back: the layout of NativeExpertLayout / NativeFmt), layer by layer, each
+// layer 4 KiB aligned; <dir>/glm-pack.txt indexes it ("glm-pack 1 <gguf bytes> <file bytes>", then one line per
+// layer: "<layer> <offset> <blob bytes> <gate/up type> <down type>").
+struct PackLayer { int64_t off = -1; size_t blob = 0; int gu = -1, d = -1; };
+
+uint64_t gguf_bytes(const strata::GgufModel& g) {
+    uint64_t n = 0;
+    for (size_t i = 0; i < g.size(); ++i) n += g.shard(i).file_size();
+    return n;
+}
+
+int write_pack(Model& M, const std::string& dir) {
+    ::mkdir(dir.c_str(), 0755);
+    const std::string bin = dir + "/experts.bin", idx = dir + "/glm-pack.txt";
+    const int fd = ::open(bin.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) throw std::runtime_error("cannot create " + bin);
+    std::vector<PackLayer> lay(M.n_layer);
+    int64_t off = 0;
+    std::vector<uint8_t> buf;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int il = 0; il < M.n_layer; ++il) {
+        const auto& L = M.layers[il];
+        if (!L.moe) continue;
+        if (L.eg.type != L.eu.type) throw std::runtime_error("pack: gate and up types differ");
+        const size_t gb = L.eg.bytes / M.n_expert, db = L.ed.bytes / M.n_expert, blob = 2 * gb + db;
+        off = (off + 4095) & ~int64_t(4095);
+        lay[il] = {off, blob, L.eg.type, L.ed.type};
+        const int per = 32;
+        buf.resize((size_t) per * blob);
+        for (int e0 = 0; e0 < M.n_expert; e0 += per) {
+            const int n = std::min(per, M.n_expert - e0);
+            for (int j = 0; j < n; ++j) {
+                uint8_t* b = buf.data() + (size_t) j * blob;
+                std::memcpy(b, L.eg.host + (size_t) (e0 + j) * gb, gb);
+                std::memcpy(b + gb, L.eu.host + (size_t) (e0 + j) * gb, gb);
+                std::memcpy(b + 2 * gb, L.ed.host + (size_t) (e0 + j) * db, db);
+            }
+            const size_t want = (size_t) n * blob;
+            if (::pwrite(fd, buf.data(), want, off + (int64_t) e0 * (int64_t) blob) != (ssize_t) want)
+                throw std::runtime_error("pack: write failed");
+        }
+        off += (int64_t) M.n_expert * (int64_t) blob;
+        ::fdatasync(fd);
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // keep the page cache for the GGUF reads
+        for (const Ten* t : {&L.eg, &L.eu, &L.ed})        // and drop the source pages already copied
+            ::madvise((void*) ((uintptr_t) t->host & ~uintptr_t(4095)), t->bytes, MADV_DONTNEED);
+        std::printf("  layer %d: %d experts of %.2f MB (%s/%s), %.1f GB written, %.0f s\n", il, M.n_expert, blob / 1e6,
+                    strata::ggml_type_name(L.eg.type), strata::ggml_type_name(L.ed.type), off / 1e9,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    ::close(fd);
+    std::FILE* f = std::fopen(idx.c_str(), "w");
+    if (!f) throw std::runtime_error("cannot write " + idx);
+    std::fprintf(f, "glm-pack 1 %llu %llu\n", (unsigned long long) gguf_bytes(*M.gguf), (unsigned long long) off);
+    for (int il = 0; il < M.n_layer; ++il)
+        if (lay[il].off >= 0)
+            std::fprintf(f, "%d %lld %zu %d %d\n", il, (long long) lay[il].off, lay[il].blob, lay[il].gu, lay[il].d);
+    std::fclose(f);
+    std::printf("pack: %s, %.2f GB\n", bin.c_str(), off / 1e9);
+    return 0;
+}
+
+// The pack at run time: experts.bin mapped; with a RAM budget the first experts (in the order given) are copied
+// into pinned memory, which the copy engine reads at the link's full speed; the rest stay in the mapping.
+struct Pack {
+    std::vector<PackLayer> lay;
+    const uint8_t* map = nullptr;
+    size_t map_bytes = 0;
+    uint8_t* pinned = nullptr;
+    size_t pinned_bytes = 0;
+    std::vector<const uint8_t*> where;   // [layer * n_expert + e]: the blob's address (pinned or mapped)
+    std::vector<uint8_t> is_pinned;
+    int n_expert = 0;
+
+    void open(const Model& M, const std::string& dir) {
+        std::FILE* f = std::fopen((dir + "/glm-pack.txt").c_str(), "r");
+        if (!f) throw std::runtime_error("no GLM pack in " + dir + " (strata-glm --pack-out " + dir + " writes it)");
+        unsigned long long gb = 0, fb = 0;
+        int ver = 0;
+        if (std::fscanf(f, "glm-pack %d %llu %llu", &ver, &gb, &fb) != 3 || ver != 1) throw std::runtime_error("bad glm-pack.txt");
+        if (gb != gguf_bytes(*M.gguf)) throw std::runtime_error("the GLM pack was written from another GGUF: write it again");
+        lay.assign(M.n_layer, PackLayer{});
+        int il;
+        long long off;
+        size_t blob;
+        int gu, d;
+        while (std::fscanf(f, "%d %lld %zu %d %d", &il, &off, &blob, &gu, &d) == 5)
+            if (il >= 0 && il < M.n_layer) lay[il] = {off, blob, gu, d};
+        std::fclose(f);
+        const int fd = ::open((dir + "/experts.bin").c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("cannot open experts.bin");
+        struct stat sb;
+        ::fstat(fd, &sb);
+        if ((unsigned long long) sb.st_size != fb) throw std::runtime_error("experts.bin has the wrong size");
+        map_bytes = (size_t) sb.st_size;
+        map = (const uint8_t*) ::mmap(nullptr, map_bytes, PROT_READ, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (map == MAP_FAILED) throw std::runtime_error("cannot map experts.bin");
+        n_expert = M.n_expert;
+        where.assign((size_t) M.n_layer * n_expert, nullptr);
+        is_pinned.assign(where.size(), 0);
+        for (int l = 0; l < M.n_layer; ++l)
+            if (lay[l].off >= 0)
+                for (int e = 0; e < n_expert; ++e) where[(size_t) l * n_expert + e] = map + lay[l].off + (size_t) e * lay[l].blob;
+    }
+    // Copy experts into pinned RAM in `order` (layer * n_expert + e) until `budget` bytes are used.
+    void pin(const std::vector<int>& order, size_t budget) {
+        size_t need = 0;
+        for (int k : order) {
+            const size_t b = lay[k / n_expert].blob;
+            if (need + b > budget) break;
+            need += b;
+        }
+        if (need == 0) return;
+        if (cudaHostAlloc((void**) &pinned, need, cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            throw std::runtime_error("cannot pin " + std::to_string(need >> 20) + " MiB of RAM for experts");
+        }
+        pinned_bytes = need;
+        size_t at = 0;
+        for (int k : order) {
+            const size_t b = lay[k / n_expert].blob;
+            if (at + b > need) break;
+            std::memcpy(pinned + at, where[k], b);
+            where[k] = pinned + at;
+            is_pinned[k] = 1;
+            at += b;
+        }
+        ::madvise((void*) map, map_bytes, MADV_DONTNEED);   // the copied pages are not needed from the file
+    }
+    const uint8_t* blob(int l, int e) const { return where[(size_t) l * n_expert + e]; }
+};
+
 float* dalloc(size_t n) {
     float* p = nullptr;
     ck(cudaMalloc(&p, n * sizeof(float)), "cudaMalloc buffer");
@@ -302,6 +446,83 @@ struct Engine {
     void *exq = nullptr, *exq2 = nullptr;
     double ms_copy = 0, ms_layers = 0;
     size_t bytes_streamed = 0;
+
+    // ---- the pack and the CPU's share of the experts
+    Pack* pk = nullptr;
+    std::unique_ptr<C::ExpertPool> pool;
+    std::vector<C::NativeFmt> fmt;           // per MoE layer
+    float* h_host = nullptr;                 // pinned: the layer inputs, T rows
+    float* y_host = nullptr;                 // pinned: the CPU experts' outputs, T*k rows
+    int have_t = 0, have_k = 0;
+    std::vector<uint8_t> nact;               // per-token quantized activations for the CPU
+    uint8_t* stage_blob = nullptr;           // one expert blob on the device (the pack layout)
+    double cpu_gbps = 16.0;                  // the CPU's measured rate, blob bytes per pass per second (EMA)
+    double gpu_gbps_pinned = 7.0, gpu_gbps_mapped = 4.5;
+    bool cpu_share = true;
+    int64_t n_cpu_experts = 0, n_gpu_experts = 0;
+    double ms_cpu = 0;
+
+    void use_pack(Pack* p, int workers) {
+        pk = p;
+        fmt.assign(M.n_layer, C::NativeFmt{});
+        size_t max_blob = 0;
+        for (int il = 0; il < M.n_layer; ++il) {
+            const auto& pl = pk->lay[il];
+            if (pl.off < 0) continue;
+            std::string err;
+            if (!C::native_fmt(pl.gu, pl.d, M.n_embd, M.n_ff_exp, fmt[il], err)) throw std::runtime_error(err);
+            if (fmt[il].bytes != pl.blob) throw std::runtime_error("pack blob size does not match the layer format");
+            max_blob = std::max(max_blob, pl.blob);
+        }
+        float lim = M.clamp_exp.empty() ? 0.0f : M.clamp_exp[0];
+        for (float v : M.clamp_exp) if (v != lim) throw std::runtime_error("per-layer SwiGLU limits are not supported by the CPU path");
+        C::g_glu_limit = lim;
+        pool = std::make_unique<C::ExpertPool>(workers);
+        ck(cudaMalloc(&stage_blob, max_blob), "stage blob");
+        std::printf("strata-glm: CPU expert pool, %d workers + the host thread; %.1f GiB of experts pinned in RAM\n",
+                    pool->workers(), pk->pinned_bytes / 1073741824.0);
+    }
+    void ensure_host(int rows_t, int rows_k) {
+        if (rows_t > have_t) {
+            if (h_host) cudaFreeHost(h_host);
+            ck(cudaHostAlloc((void**) &h_host, (size_t) rows_t * M.n_embd * sizeof(float), 0), "h_host");
+            nact.resize((size_t) rows_t * C::kNativeActBytes);
+            have_t = rows_t;
+        }
+        if (rows_k > have_k) {
+            if (y_host) cudaFreeHost(y_host);
+            ck(cudaHostAlloc((void**) &y_host, (size_t) rows_k * M.n_embd * sizeof(float), 0), "y_host");
+            have_k = rows_k;
+        }
+    }
+    // The CPU's experts of one layer: `cpu` holds (expert, first row, rows) of the grouped rows (htok: token of a row);
+    // outputs into y_host rows (the grouped row index).
+    void cpu_experts(int il, const std::vector<std::array<int, 3>>& cpu, const std::vector<int32_t>& htok) {
+        if (cpu.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const C::NativeFmt& f = fmt[il];
+        std::vector<C::ExpertJobMulti> jobs;
+        size_t passes_bytes = 0;
+        for (const auto& c : cpu) {
+            const uint8_t* b = pk->blob(il, c[0]);
+            for (int r = c[1]; r < c[1] + c[2]; r += C::MAXT) {
+                C::ExpertJobMulti j;
+                j.blob = b;
+                j.nt = std::min(C::MAXT, c[1] + c[2] - r);
+                for (int t = 0; t < j.nt; ++t) {
+                    j.nact[t] = nact.data() + (size_t) htok[r + t] * C::kNativeActBytes;
+                    j.out[t] = y_host + (size_t) (r + t) * M.n_embd;
+                }
+                jobs.push_back(j);
+                passes_bytes += f.bytes;
+            }
+        }
+        pool->run_split_multi_native(f, jobs.data(), (int) jobs.size());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ms_cpu += ms;
+        if (ms > 0.5) cpu_gbps = 0.8 * cpu_gbps + 0.2 * (passes_bytes / 1e6 / ms);
+        n_cpu_experts += (int64_t) cpu.size();
+    }
 
     void alloc_batch(int T) {
         Tmax = T;
@@ -433,23 +654,70 @@ struct Engine {
         ck(cudaMemcpyAsync(rtok, htok.data(), htok.size() * sizeof(int32_t), cudaMemcpyHostToDevice, st), "rtok");
         ck(cudaMemcpyAsync(rdst, hdst.data(), hdst.size() * sizeof(int32_t), cudaMemcpyHostToDevice, st), "rdst");
         const size_t gbytes = L.eg.bytes / M.n_expert, dbytes = L.ed.bytes / M.n_expert;
-        for (int e = 0; e < M.n_expert; ++e) {
-            const int r0 = count[e], n = count[e + 1] - count[e];
-            if (n == 0) continue;
-            const auto c0 = std::chrono::steady_clock::now();
-            ck(cudaMemcpyAsync(stage_g, L.eg.host + (size_t) e * gbytes, gbytes, cudaMemcpyHostToDevice, st), "eg");
-            ck(cudaMemcpyAsync(stage_u, L.eu.host + (size_t) e * gbytes, gbytes, cudaMemcpyHostToDevice, st), "eu");
-            ck(cudaMemcpyAsync(stage_d, L.ed.host + (size_t) e * dbytes, dbytes, cudaMemcpyHostToDevice, st), "ed");
-            ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
-            bytes_streamed += 2 * gbytes + dbytes;
-            G::set_pair(e_bounds, 0, n, st);
-            Q::quantize(bh, rtok + r0, exq, L.eg.type, E, E, n, st);
-            expert_product(L.eg.type, stage_g, E, F, gbytes, exq, n, bge);
-            expert_product(L.eu.type, stage_u, E, F, gbytes, exq, n, bue);
-            G::swiglu_clamp(bge, bue, bae, n * F, M.clamp_exp[il], st);
-            Q::quantize(bae, nullptr, exq2, L.ed.type, F, F, n, st);
-            expert_product(L.ed.type, stage_d, F, E, dbytes, exq2, n, bye);
-            G::scatter_scaled(bye, rdst + r0, rdst + r0, bw, bparts, n, E, st);
+        // which experts the CPU takes: the ones with the fewest rows, while that shortens the slower side
+        std::vector<int> order;
+        for (int e = 0; e < M.n_expert; ++e) if (count[e + 1] > count[e]) order.push_back(e);
+        std::vector<uint8_t> on_cpu(M.n_expert, 0);
+        if (pk && cpu_share) {
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return count[a + 1] - count[a] < count[b + 1] - count[b]; });
+            double gpu_ms = 0, cpu_ms = 0;
+            auto gcost = [&](int e) { return pk->lay[il].blob / 1e6 / (pk->is_pinned[(size_t) il * M.n_expert + e] ? gpu_gbps_pinned : gpu_gbps_mapped); };
+            auto ccost = [&](int e) { return (double) ((count[e + 1] - count[e] + C::MAXT - 1) / C::MAXT) * pk->lay[il].blob / 1e6 / cpu_gbps; };
+            for (int e : order) gpu_ms += gcost(e);
+            for (int e : order) {
+                const double g2 = gpu_ms - gcost(e), c2 = cpu_ms + ccost(e);
+                if (std::max(g2, c2) >= std::max(gpu_ms, cpu_ms)) break;
+                gpu_ms = g2; cpu_ms = c2; on_cpu[e] = 1;
+            }
+        }
+        std::vector<std::array<int, 3>> cpu_list;
+        for (int e = 0; e < M.n_expert; ++e)
+            if (on_cpu[e]) cpu_list.push_back({e, count[e], count[e + 1] - count[e]});
+        if (!cpu_list.empty()) {   // the CPU needs the layer inputs on the host
+            ensure_host(T, T * k);
+            ck(cudaMemcpyAsync(h_host, bh, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, st), "h to host");
+            ck(cudaStreamSynchronize(st), "h sync");
+            for (int t = 0; t < T; ++t)
+                C::native_quant_act(fmt[il], h_host + (size_t) t * E, nact.data() + (size_t) t * C::kNativeActBytes);
+        }
+        // the GPU's experts, queued from their own thread while this one runs the CPU's
+        auto gpu_side = [&]() {
+            for (int e = 0; e < M.n_expert; ++e) {
+                const int r0 = count[e], n = count[e + 1] - count[e];
+                if (n == 0 || on_cpu[e]) continue;
+                const void *wg, *wu, *wd;
+                if (pk) {
+                    ck(cudaMemcpyAsync(stage_blob, pk->blob(il, e), pk->lay[il].blob, cudaMemcpyHostToDevice, st), "blob");
+                    wg = stage_blob; wu = stage_blob + gbytes; wd = stage_blob + 2 * gbytes;
+                    bytes_streamed += pk->lay[il].blob;
+                } else {
+                    ck(cudaMemcpyAsync(stage_g, L.eg.host + (size_t) e * gbytes, gbytes, cudaMemcpyHostToDevice, st), "eg");
+                    ck(cudaMemcpyAsync(stage_u, L.eu.host + (size_t) e * gbytes, gbytes, cudaMemcpyHostToDevice, st), "eu");
+                    ck(cudaMemcpyAsync(stage_d, L.ed.host + (size_t) e * dbytes, dbytes, cudaMemcpyHostToDevice, st), "ed");
+                    wg = stage_g; wu = stage_u; wd = stage_d;
+                    bytes_streamed += 2 * gbytes + dbytes;
+                }
+                ++n_gpu_experts;
+                G::set_pair(e_bounds, 0, n, st);
+                Q::quantize(bh, rtok + r0, exq, L.eg.type, E, E, n, st);
+                expert_product(L.eg.type, wg, E, F, gbytes, exq, n, bge);
+                expert_product(L.eu.type, wu, E, F, gbytes, exq, n, bue);
+                G::swiglu_clamp(bge, bue, bae, n * F, M.clamp_exp[il], st);
+                Q::quantize(bae, nullptr, exq2, L.ed.type, F, F, n, st);
+                expert_product(L.ed.type, wd, F, E, dbytes, exq2, n, bye);
+                G::scatter_scaled(bye, rdst + r0, rdst + r0, bw, bparts, n, E, st);
+            }
+        };
+        const auto c0 = std::chrono::steady_clock::now();
+        std::thread gpu_thread(gpu_side);
+        cpu_experts(il, cpu_list, htok);
+        gpu_thread.join();
+        ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        // the CPU's rows to the device, weighted into their slots
+        for (const auto& c : cpu_list) {
+            ck(cudaMemcpyAsync(bye + (size_t) c[1] * E, y_host + (size_t) c[1] * E, (size_t) c[2] * E * sizeof(float),
+                               cudaMemcpyHostToDevice, st), "cpu rows");
+            G::scatter_scaled(bye + (size_t) c[1] * E, rdst + c[1], rdst + c[1], bw, bparts, c[2], E, st);
         }
         G::sum_parts(bparts, bshared, bout, T, k, E, st);
     }
@@ -507,7 +775,7 @@ struct Engine {
         vh = dalloc((size_t) M.n_head * M.dv_mla); scores = dalloc((size_t) M.n_head * ctx);
         ik = dalloc(M.ix_dim); ig = dalloc(M.ix_dim); iqv = dalloc((size_t) M.ix_heads * M.ix_dim); iw = dalloc(M.ix_heads);
         pooled = dalloc(M.ix_dim);
-        fg = dalloc(M.n_ff); fu = dalloc(M.n_ff); fa2 = dalloc(M.n_ff); fy = dalloc(E);
+        fg = dalloc(M.n_ff); fu = dalloc(M.n_ff); fa2 = dalloc(M.n_ff); fy = dalloc((size_t) M.n_used * E);
         logits_r = dalloc(M.n_expert); ew = dalloc(M.n_used);
         ck(cudaMalloc(&eids, M.n_used * sizeof(int32_t)), "eids");
         logits = dalloc(M.n_vocab);
@@ -646,6 +914,22 @@ struct Engine {
         ck(cudaStreamSynchronize(st), "sync ids");
         const size_t gb = L.eg.bytes / M.n_expert, db = L.ed.bytes / M.n_expert;
         ck(cudaMemsetAsync(acc, 0, E * sizeof(float), st), "acc");
+        if (pk) {   // the CPU computes the 8 experts from RAM while the GPU runs the shared expert
+            ensure_host(1, M.n_used);
+            ck(cudaMemcpyAsync(h_host, h, E * sizeof(float), cudaMemcpyDeviceToHost, st), "h to host");
+            ck(cudaStreamSynchronize(st), "h sync");
+            swiglu_ffn(L.sg, L.sg.d, L.su, L.su.d, L.sd, L.sd.d, h, out, M.n_ff_exp, M.clamp_sh[il]);
+            C::native_quant_act(fmt[il], h_host, nact.data());
+            std::vector<std::array<int, 3>> cl;
+            std::vector<int32_t> htok(M.n_used, 0);
+            for (int j = 0; j < M.n_used; ++j) cl.push_back({ids[j], j, 1});
+            cpu_experts(il, cl, htok);
+            ck(cudaMemcpyAsync(fy, y_host, (size_t) M.n_used * E * sizeof(float), cudaMemcpyHostToDevice, st), "cpu rows");
+            for (int j = 0; j < M.n_used; ++j) G::axpy_dev(acc, fy + (size_t) j * E, ew + j, E, st);
+            G::add_inplace(acc, out, E, st);
+            ck(cudaMemcpyAsync(out, acc, E * sizeof(float), cudaMemcpyDeviceToDevice, st), "moe out");
+            return;
+        }
         for (int j = 0; j < M.n_used; ++j) {
             const int e = ids[j];
             ck(cudaMemcpyAsync(stage_g, L.eg.host + (size_t) e * gb, gb, cudaMemcpyHostToDevice, st), "expert g");
@@ -775,7 +1059,10 @@ std::vector<int32_t> parse_ids(const std::string& s) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string model, tokens;
-    int max_new = 8, ctx = 4096, top = 5, chunk = 0;
+    int max_new = 8, ctx = 4096, top = 5, chunk = 0, workers = 0;
+    std::string pack_out, pack_dir;
+    double ram_gib = 0;
+    bool no_cpu = false;
     bool dump = false, self = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -789,12 +1076,18 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::stoi(next());
         else if (a == "--top") top = std::stoi(next());
         else if (a == "--chunk") chunk = std::stoi(next());
+        else if (a == "--pack-out") pack_out = next();
+        else if (a == "--pack") pack_dir = next();
+        else if (a == "--ram-gib") ram_gib = std::stod(next());
+        else if (a == "--pool-workers") workers = std::stoi(next());
+        else if (a == "--no-cpu-share") no_cpu = true;
         else if (a == "--dump") dump = true;
         else if (a == "--selftest") self = true;
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return 2; }
     }
-    if (model.empty() || (tokens.empty() && !self)) {
-        std::fprintf(stderr, "usage: strata-glm --model <GGUF shard 1> --tokens 1,2,3 [--max-new N] [--ctx N] [--top K] [--dump]\n");
+    if (model.empty() || (tokens.empty() && !self && pack_out.empty())) {
+        std::fprintf(stderr, "usage: strata-glm --model <GGUF shard 1> --tokens 1,2,3 [--max-new N] [--ctx N] [--top K] [--chunk T] [--dump]\n"
+                     "       [--pack DIR [--ram-gib N] [--pool-workers N] [--no-cpu-share]] | --pack-out DIR | --selftest\n");
         return 2;
     }
     try {
@@ -808,7 +1101,23 @@ int main(int argc, char** argv) {
                     M.n_embd, M.n_expert, M.n_used, M.n_vocab, M.vram_weights / 1073741824.0,
                     std::chrono::duration<double>(clk::now() - t0).count());
         if (self) return selftest(M);
+        if (!pack_out.empty()) return write_pack(M, pack_out);
+        Pack P;
+        if (!pack_dir.empty()) {
+            P.open(M, pack_dir);
+            std::vector<int> order;   // pinned first: every layer's experts in order (a routing profile comes later)
+            for (int e = 0; e < M.n_expert; ++e)
+                for (int l = 0; l < M.n_layer; ++l)
+                    if (P.lay[l].off >= 0) order.push_back(l * M.n_expert + e);
+            const auto tp0 = clk::now();
+            P.pin(order, (size_t) (ram_gib * 1073741824.0));
+            if (P.pinned_bytes)
+                std::printf("strata-glm: %.1f GiB of experts copied into pinned RAM in %.1f s\n", P.pinned_bytes / 1073741824.0,
+                            std::chrono::duration<double>(clk::now() - tp0).count());
+        }
         Engine E(M, ctx);
+        if (!pack_dir.empty()) E.use_pack(&P, workers);
+        E.cpu_share = !no_cpu;
         E.dump = dump;
         const std::vector<int32_t> prompt = parse_ids(tokens);
         std::vector<float> lg(M.n_vocab);
@@ -850,8 +1159,9 @@ int main(int argc, char** argv) {
         std::printf("\nprompt %zu tokens in %.2f s (%.2f tok/s); decode %d tokens in %.2f s (%.2f tok/s)\n", prompt.size(),
                     prompt_s, prompt.size() / prompt_s, max_new - 1, dec_s, (max_new - 1) / std::max(dec_s, 1e-9));
         if (chunk > 0)
-            std::printf("prompt path: %.2f GB of experts copied to the GPU (host time in copy calls %.0f ms)\n",
-                        E.bytes_streamed / 1e9, E.ms_copy);
+            std::printf("prompt path: %.2f GB of experts copied to the GPU; experts on the GPU %lld, on the CPU %lld "
+                        "(CPU %.0f ms, %.1f GB/s per pass); MoE wall %.0f ms\n", E.bytes_streamed / 1e9,
+                        (long long) E.n_gpu_experts, (long long) E.n_cpu_experts, E.ms_cpu, E.cpu_gbps, E.ms_copy);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-glm: %s\n", e.what());
         return 1;
