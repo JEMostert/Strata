@@ -37,6 +37,8 @@ void kda_conv_silu(const float* x, float* state, const float* w, float* y, int c
 /// KDA decay: g = lower * sigmoid(-(gf + dt_bias) * A[head]) per channel (A = -exp(A_log) per head).
 void kda_gate(const float* gf, const float* dt_bias, const float* A, float* g, int n_head, int head_dim,
               float lower, void* stream);
+/// x *= a, n values.
+void scale_inplace(float* x, int n, float a, void* stream);
 /// sigmoid in place.
 void sigmoid_inplace(float* x, int n, void* stream);
 /// The gated delta rule, one token, every head: S (head x [j][i], row j = column j of S) decays by exp(g[i]),
@@ -92,7 +94,14 @@ void layer_norm_rows(const float* x, const float* w, const float* b, float* y, i
 /// indexer_kpool_select_tail, true by default), so below the indexer's top-k every position 0..p0+t.
 /// q_abs, out: [T][n_head][lat]. n_head % 8 == 0.
 void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
-                     float scale, float* out, void* stream);
+                     float scale, float* out, void* stream, const uint8_t* sel = nullptr, int64_t sel_ld = 0);
+/// The DSA indexer's pool scores for T queries at positions p0..: score[t][j] = sum_h w[t][h] relu(q[t][h] . pk[j])
+/// for the complete pools visible to the query (j < (p0 + t + 1) / kpool), -inf for the rest; [T][n_pool].
+void ix_scores(const float* q, const float* w, const float* pooled, int64_t p0, int T, int n_head, int dim, int kpool,
+               int64_t n_pool, float* scores, void* stream);
+/// The top `n_top` visible pools of each query (all of them when fewer are visible): sel[t][j] = 1 for the chosen.
+void ix_select(const float* scores, int64_t p0, int T, int kpool, int64_t n_pool, int n_top, uint8_t* sel,
+               void* stream);
 /// The k-pool keys of pools [pool0, pool0 + n) from the key/gate caches ([pos][dim]) into pooled [pool][dim].
 void kpool_keys(const float* key_cache, const float* gate_cache, const float* ape, float* pooled, int64_t pool0, int n,
                 int kpool, int dim, void* stream);

@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <stdexcept>
 #include <string>
@@ -186,6 +187,11 @@ __global__ void kda_gate_kernel(const float* gf, const float* dt_bias, const flo
     if (i >= n) return;
     const float t = (gf[i] + dt_bias[i]) * A[i / head_dim];
     g[i] = sigmoidf_(-t) * lower;
+}
+
+__global__ void scale_kernel(float* x, int n, float a) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= a;
 }
 
 __global__ void sigmoid_kernel(float* x, int n) {
@@ -512,12 +518,14 @@ __global__ void layer_norm_rows_kernel(const float* x, const float* w, const flo
 // block in tiles through shared memory, online softmax per head, lane-held accumulators (lat / 32 per lane).
 template <int LAT>
 __global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, int64_t p0, int n_head, int kpool,
-                                       float scale, float* out) {
+                                       float scale, float* out, const uint8_t* sel, int64_t sel_ld) {
     constexpr int TILE = 16, PER = LAT / 32;
     __shared__ float tile[TILE][LAT];
     const int t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int h = blockIdx.x * 8 + warp;
     const int64_t n_vis = p0 + t + 1;   // complete pools + the tail (the token itself included): see mla_attend_rows
+    const int64_t tail0 = ((p0 + t + 1) / kpool) * kpool;   // positions from here on are the tail, always seen
+    const uint8_t* srow = sel ? sel + (size_t) t * sel_ld : nullptr;
     float q[PER], acc[PER];
     const float* qh = q_abs + ((size_t) t * n_head + h) * LAT;
     for (int i = 0; i < PER; ++i) { q[i] = qh[lane + 32 * i]; acc[i] = 0.0f; }
@@ -531,17 +539,21 @@ __global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, i
         float sc[TILE];
         float tmax = -FLT_MAX;
         for (int l = 0; l < nt; ++l) {
+            const int64_t ps = t0 + l;
+            if (srow && ps < tail0 && !srow[ps / kpool]) { sc[l] = -FLT_MAX; continue; }   // a pool not selected
             float s = 0.0f;
             for (int i = 0; i < PER; ++i) s += q[i] * tile[l][lane + 32 * i];
             s = warp_sum(s) * scale;
             sc[l] = s;
             tmax = fmaxf(tmax, s);
         }
+        if (tmax == -FLT_MAX) continue;   // nothing selected in this tile
         const float mn = fmaxf(m, tmax);
         const float corr = expf(m - mn);
         z *= corr;
         for (int i = 0; i < PER; ++i) acc[i] *= corr;
         for (int l = 0; l < nt; ++l) {
+            if (sc[l] == -FLT_MAX) continue;
             const float p = expf(sc[l] - mn);
             z += p;
             for (int i = 0; i < PER; ++i) acc[i] += p * tile[l][lane + 32 * i];
@@ -551,6 +563,77 @@ __global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, i
     float* oh = out + ((size_t) t * n_head + h) * LAT;
     const float inv = n_vis > 0 ? 1.0f / z : 0.0f;
     for (int i = 0; i < PER; ++i) oh[lane + 32 * i] = acc[i] * inv;
+}
+
+// one block per query: q (n_head x dim) and the weights in shared memory, a warp per pool
+__global__ void ix_scores_kernel(const float* q, const float* w, const float* pooled, int64_t p0, int n_head, int dim,
+                                 int kpool, int64_t n_pool, float* scores) {
+    extern __shared__ float qs[];   // n_head * dim + n_head
+    const int t = blockIdx.y;
+    const float* qt = q + (size_t) t * n_head * dim;
+    for (int i = threadIdx.x; i < n_head * dim; i += blockDim.x) qs[i] = qt[i];
+    for (int i = threadIdx.x; i < n_head; i += blockDim.x) qs[n_head * dim + i] = w[(size_t) t * n_head + i];
+    __syncthreads();
+    const int64_t vis = (p0 + t + 1) / kpool;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+    for (int64_t j = (int64_t) blockIdx.x * warps + warp; j < n_pool; j += (int64_t) gridDim.x * warps) {
+        float sc = -INFINITY;
+        if (j < vis) {
+            const float* pk = pooled + (size_t) j * dim;
+            float acc = 0.0f;
+            for (int hh = 0; hh < n_head; ++hh) {
+                float d = 0.0f;
+                for (int i = lane; i < dim; i += 32) d += qs[hh * dim + i] * pk[i];
+                d = warp_sum(d);
+                acc += qs[n_head * dim + hh] * fmaxf(d, 0.0f);
+            }
+            sc = acc;
+        }
+        if (lane == 0) scores[(size_t) t * n_pool + j] = sc;
+    }
+}
+
+__device__ __forceinline__ uint32_t f2key(float f) {   // order-preserving float -> uint32
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// one block per query: the n_top-th largest key by bisection on the 32 key bits, then mark (ties in index order)
+__global__ void ix_select_kernel(const float* scores, int64_t p0, int kpool, int64_t n_pool, int n_top, uint8_t* sel) {
+    const int t = blockIdx.x;
+    const float* sr = scores + (size_t) t * n_pool;
+    uint8_t* so = sel + (size_t) t * n_pool;
+    const int64_t vis = min((p0 + t + 1) / kpool, n_pool);
+    for (int64_t j = threadIdx.x; j < n_pool; j += blockDim.x) so[j] = 0;
+    __syncthreads();
+    if (vis <= n_top) {
+        for (int64_t j = threadIdx.x; j < vis; j += blockDim.x) so[j] = 1;
+        return;
+    }
+    __shared__ uint32_t s_thr;
+    __shared__ unsigned s_cnt;
+    uint32_t lo = 0, hi = 0xffffffffu;   // find the largest key thr with count(key >= thr) >= n_top
+    while (lo < hi) {
+        const uint32_t mid = lo + (uint32_t) (((uint64_t) hi - lo + 1) / 2);
+        if (threadIdx.x == 0) s_cnt = 0;
+        __syncthreads();
+        unsigned c = 0;
+        for (int64_t j = threadIdx.x; j < vis; j += blockDim.x) c += f2key(sr[j]) >= mid;
+        c = (unsigned) block_sum((float) c);
+        if (c >= (unsigned) n_top) lo = mid; else hi = mid - 1;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { s_thr = lo; s_cnt = 0; }
+    __syncthreads();
+    const uint32_t thr = s_thr;
+    for (int64_t j = threadIdx.x; j < vis; j += blockDim.x)
+        if (f2key(sr[j]) > thr) { so[j] = 1; atomicAdd(&s_cnt, 1u); }
+    __syncthreads();
+    if (threadIdx.x == 0) {   // ties at the threshold, lowest index first, until n_top
+        unsigned have = s_cnt;
+        for (int64_t j = 0; j < vis && have < (unsigned) n_top; ++j)
+            if (f2key(sr[j]) == thr) { so[j] = 1; ++have; }
+    }
 }
 
 __global__ void kpool_keys_kernel(const float* key_cache, const float* gate_cache, const float* ape, float* pooled,
@@ -677,6 +760,10 @@ void kda_gate(const float* gf, const float* dt_bias, const float* A, float* g, i
     kda_gate_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(gf, dt_bias, A, g, n, head_dim, lower);
     check("kda_gate");
 }
+void scale_inplace(float* x, int n, float a, void* stream) {
+    scale_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(x, n, a);
+    check("scale");
+}
 void sigmoid_inplace(float* x, int n, void* stream) {
     sigmoid_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(x, n);
     check("sigmoid");
@@ -760,11 +847,25 @@ void layer_norm_rows(const float* x, const float* w, const float* b, float* y, i
     layer_norm_rows_kernel<<<rows, 128, 0, (cudaStream_t) stream>>>(x, w, b, y, n, eps);
     check("layer_norm_rows");
 }
+void ix_scores(const float* q, const float* w, const float* pooled, int64_t p0, int T, int n_head, int dim, int kpool,
+               int64_t n_pool, float* scores, void* stream) {
+    const size_t sh = ((size_t) n_head * dim + n_head) * sizeof(float);
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(ix_scores_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024); attr = true; }
+    const unsigned gx = (unsigned) std::min<int64_t>((n_pool + 7) / 8, 64);
+    ix_scores_kernel<<<dim3(gx, T), 256, sh, (cudaStream_t) stream>>>(q, w, pooled, p0, n_head, dim, kpool, n_pool, scores);
+    check("ix_scores");
+}
+void ix_select(const float* scores, int64_t p0, int T, int kpool, int64_t n_pool, int n_top, uint8_t* sel,
+               void* stream) {
+    ix_select_kernel<<<T, 256, 0, (cudaStream_t) stream>>>(scores, p0, kpool, n_pool, n_top, sel);
+    check("ix_select");
+}
 void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
-                     float scale, float* out, void* stream) {
+                     float scale, float* out, void* stream, const uint8_t* sel, int64_t sel_ld) {
     if (lat != 512 || n_head % 8) throw std::runtime_error("mla_attend_rows: built for 512-wide latents, 8k heads");
     mla_attend_rows_kernel<512><<<dim3(n_head / 8, T), 256, 0, (cudaStream_t) stream>>>(q_abs, cache, p0, n_head, kpool,
-                                                                                       scale, out);
+                                                                                       scale, out, sel, sel_ld);
     check("mla_attend_rows");
 }
 void kpool_keys(const float* key_cache, const float* gate_cache, const float* ape, float* pooled, int64_t pool0, int n,

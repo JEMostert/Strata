@@ -65,3 +65,21 @@ nothing is read from the SSD while answering.
 
 - 2026-10-07: model downloaded on the target PC; CUDA 13.2 installed; Strata (upstream main + the balanced PCIe
   share) builds and passes its tests there except three that need a Qwen pack or a higher `ulimit -l`.
+- **Baseline, mainline llama.cpp** (5ad1c5d, `-ngl 99 --cpu-moe -fa on`, warm page cache; the 102 GB file does
+  not fit the 91 GB of RAM): decode 7.0-9.5 tokens/s, a 2,286-token prompt read at 13.4 tokens/s (171 s), a
+  378-token one at 18.1 tokens/s. PCIe measured 7.2 GB/s each way (4.0 x4).
+- **Bring-up correct.** `strata-glm` one token at a time: "The capital of France is" -> " Paris. France is a
+  country", the same text and top-1 at every step as llama.cpp, top-3 log-probabilities within 0.1-0.3. The batched
+  prompt path (`--chunk`): same top-1 and top-4 set as llama.cpp on a 378-token prompt; the remaining differences
+  (up to 0.5 in log-probability) are the size of llama.cpp's own difference between `-ub 1` and its default batch
+  (154842: -2.27 vs -1.76), i.e. rounding through 45 layers of a 2-bit model. Found on the way: llama.cpp's
+  `indexer_kpool_select_tail` defaults to true (the GGUF does not set it), so a query also sees its incomplete pool
+  - below 2,048 tokens every position up to itself.
+- **llama.cpp oddity (not copied):** its one-token KDA path scales q by 1/sqrt(128) in the graph and again inside
+  the gated-delta-net op; the chunked prompt path scales once. The per-head RMS norm after the recurrence hides most
+  of it (only through its epsilon).
+- **Prompt path, first cut:** 378 tokens in 19.1 s (19.8 tokens/s), 81.5 GB of expert weights copied over PCIe from
+  pageable memory at ~4.6 GB/s - the copy is the whole cost. Every MMQ product GLM needs passes `--selftest`
+  against the one-token kernels (19 weight kinds, IQ2_XXS / IQ3_XXS / IQ4_XS / IQ2_S experts included).
+- Known: `prefill_mmq_kquant_test` (built only with the opt-in `STRATA_MMQ_KQUANTS`) fails on Q4_K gate/up on the
+  RTX 4090 build; GLM runs no Q4_K product through MMQ (its Q4_K head goes through MMVQ).

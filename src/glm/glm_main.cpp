@@ -595,9 +595,6 @@ struct Engine {
         const auto& L = M.layers[il];
         const int H = M.n_head;
         const int64_t p0 = pos;
-        if ((p0 + T) / M.kpool > M.ix_topk / M.kpool)
-            throw std::runtime_error("contexts past " + std::to_string(M.ix_topk) +
-                                     " tokens need the indexer's top-k selection (not implemented yet)");
         gm(L.qa, bh, T, bqa);
         G::rms_norm_rows(bqa, L.qa_norm.f(), bqr, T, M.q_lora, M.eps_rms, st);
         gm(L.qb, bqr, T, bq);
@@ -612,11 +609,42 @@ struct Engine {
         gm(L.ix_gate, bh, T, ig_cache[il] + (size_t) p0 * M.ix_dim);
         G::kpool_keys(ik_cache[il], ig_cache[il], L.ix_ape.f(), pool_cache[il], p0 / M.kpool,
                       (int) ((p0 + T) / M.kpool - p0 / M.kpool), M.kpool, M.ix_dim, st);
-        G::mla_attend_rows(bqabs, lat_cache[il], p0, T, H, M.kv_lora, M.kpool, 1.0f / std::sqrt((float) M.dk_mla), bolat, st);
+        const uint8_t* sel = indexer(L, il, bh, bqr, p0, T);
+        G::mla_attend_rows(bqabs, lat_cache[il], p0, T, H, M.kv_lora, M.kpool, 1.0f / std::sqrt((float) M.dk_mla), bolat, st,
+                           sel, sel ? n_pools() : 0);
         for (int hh = 0; hh < H; ++hh)
             gm(L.vb, (const uint8_t*) L.vb.d + hh * vb_head, vb_head, M.kv_lora, M.dv_mla, bolat + (size_t) hh * M.kv_lora,
               (int64_t) H * M.kv_lora, T, bvh + (size_t) hh * M.dv_mla, (int64_t) H * M.dv_mla);
         gm(L.wo, bvh, T, bout);
+    }
+    // ---- the DSA indexer: scores of the complete pools, top-k of them per query (null while all fit)
+    float *ix_q = nullptr, *ix_w = nullptr, *ix_sc = nullptr;
+    uint8_t* ix_sel = nullptr;
+    int ix_rows = 0;
+    int64_t n_pools() const { return ctx / M.kpool + 1; }
+    const uint8_t* indexer(const Model::Layer& L, int il, const float* hin, const float* qrin, int64_t p0, int T) {
+        const int64_t last_vis = (p0 + T) / M.kpool;   // pools visible to the chunk's last query
+        if (last_vis <= M.ix_topk / M.kpool) return nullptr;
+        if (T > ix_rows) {
+            for (void* p : {(void*) ix_q, (void*) ix_w, (void*) ix_sc, (void*) ix_sel}) if (p) cudaFree(p);
+            ix_q = dalloc((size_t) T * M.ix_heads * M.ix_dim);
+            ix_w = dalloc((size_t) T * M.ix_heads);
+            ix_sc = dalloc((size_t) T * n_pools());
+            ck(cudaMalloc(&ix_sel, (size_t) T * n_pools()), "ix_sel");
+            ix_rows = T;
+        }
+        if (T == 1) {
+            mm(L.ix_qb, qrin, ix_q);
+            G::gemv_f32(L.ix_proj.f(), hin, ix_w, M.n_embd, M.ix_heads, st);
+        } else {
+            gm(L.ix_qb, qrin, T, ix_q);
+            G::gemm_f32(L.ix_proj.f(), hin, ix_w, M.n_embd, M.ix_heads, T, st);
+        }
+        // llama.cpp: weights * 1/sqrt(dim * heads)
+        G::scale_inplace(ix_w, T * M.ix_heads, 1.0f / std::sqrt((float) (M.ix_dim * M.ix_heads)), st);
+        G::ix_scores(ix_q, ix_w, pool_cache[il], p0, T, M.ix_heads, M.ix_dim, M.kpool, n_pools(), ix_sc, st);
+        G::ix_select(ix_sc, p0, T, M.kpool, n_pools(), M.ix_topk / M.kpool, ix_sel, st);
+        return ix_sel;
     }
     void expert_product(int type, const void* w, int64_t n_in, int64_t n_out, size_t wbytes, const void* xq_, int rows,
                         float* dst) {
@@ -884,15 +912,12 @@ struct Engine {
             G::kpool_key(ik_cache[il] + (size_t) p0 * M.ix_dim, ig_cache[il] + (size_t) p0 * M.ix_dim, L.ix_ape.f(),
                          pool_cache[il] + (size_t) (p0 / M.kpool) * M.ix_dim, M.kpool, M.ix_dim, st);
         }
-        // visible: the complete pools ending at or before this token (all of them while they are within the
-        // indexer's top-k) plus the incomplete tail up to the token itself (llama.cpp's indexer_kpool_select_tail
-        // defaults to true and the GGUF does not set it): every position 0..pos
-        const int64_t n_pool_vis = (pos + 1) / M.kpool;
-        if (n_pool_vis > M.ix_topk / M.kpool)
-            throw std::runtime_error("contexts past " + std::to_string(M.ix_topk) +
-                                     " tokens need the indexer's top-k selection (not implemented yet)");
-        const int n_vis = (int) (pos + 1);
-        G::mla_attend(qabs, lc, n_vis, H, M.kv_lora, 1.0f / std::sqrt((float) M.dk_mla), olat, scores, st);
+        // visible: the complete pools ending at or before this token (the indexer's top-k of them once there are
+        // more) plus the incomplete tail up to the token itself (llama.cpp's indexer_kpool_select_tail defaults to
+        // true and the GGUF does not set it)
+        const uint8_t* sel = indexer(L, il, h, qr, pos, 1);
+        G::mla_attend_rows(qabs, lc, pos, 1, H, M.kv_lora, M.kpool, 1.0f / std::sqrt((float) M.dk_mla), olat, st, sel,
+                           sel ? n_pools() : 0);
         // per-head value: W_vb[h] (dv outputs from kv_lora inputs)
         K::native_quantize_q8_1(olat, xq, M.kv_lora * H, 1, st);
         const size_t orow = K::native_q8_1_bytes(M.kv_lora, 1);
