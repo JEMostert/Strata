@@ -1073,6 +1073,54 @@ int selftest(Model& M) {
         cudaFree(x); cudaFree(y1); cudaFree(y2);
         if (tmp) cudaFree(tmp);
     }
+    {   // attention: the tensor-core kernel against the f32 one, random queries and latents
+        const int T = 37, H = M.n_head, LAT = M.kv_lora;
+        const int64_t p0 = 150;
+        const int64_t N = p0 + T;
+        std::vector<float> hq((size_t) T * H * LAT), hc((size_t) N * LAT);
+        uint32_t seed = 777;
+        auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return ((seed >> 8) / 16777216.0f - 0.5f) * 2.0f; };
+        for (auto& v : hq) v = rnd() * 3.0f;
+        for (auto& v : hc) v = rnd();
+        float *q = dalloc(hq.size()), *c = dalloc(hc.size()), *o1 = dalloc(hq.size()), *o2 = dalloc(hq.size());
+        ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
+        ck(cudaMemcpy(c, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice), "c");
+        setenv("STRATA_GLM_ATTN_TC", "1", 1);
+        G::mla_attend_rows(q, c, p0, T, H, LAT, M.kpool, 1.0f / 16.0f, o1, st);
+        ck(cudaStreamSynchronize(st), "attn tc");
+        std::vector<float> a1(hq.size()), a2(hq.size());
+        ck(cudaMemcpy(a1.data(), o1, a1.size() * 4, cudaMemcpyDeviceToHost), "o1");
+        // the f32 reference on the host (double)
+        double md = 0, mx = 0;
+        for (int t = 0; t < T; ++t)
+            for (int hh = 0; hh < H; ++hh) {
+                const float* qq = &hq[((size_t) t * H + hh) * LAT];
+                const int64_t nv = p0 + t + 1;
+                std::vector<double> sc(nv);
+                double m = -1e30;
+                for (int64_t j = 0; j < nv; ++j) {
+                    double d = 0;
+                    for (int i = 0; i < LAT; ++i) d += (double) qq[i] * hc[(size_t) j * LAT + i];
+                    sc[j] = d / 16.0;
+                    m = std::max(m, sc[j]);
+                }
+                double z = 0;
+                for (auto& v : sc) { v = std::exp(v - m); z += v; }
+                for (int i = 0; i < LAT; ++i) {
+                    double o = 0;
+                    for (int64_t j = 0; j < nv; ++j) o += sc[j] * hc[(size_t) j * LAT + i];
+                    o /= z;
+                    const double got = a1[((size_t) t * H + hh) * LAT + i];
+                    md = std::max(md, std::fabs(got - o));
+                    mx = std::max(mx, std::fabs(o));
+                }
+            }
+        const bool ok = md <= 2e-2 * std::max(mx, 1e-3);
+        std::printf("  %-18s T %d, %lld positions  max |diff| %.3g of max |o| %.3g  %s\n", "attention (tc)", T,
+                    (long long) N, md, mx, ok ? "ok" : "MISMATCH");
+        bad += !ok;
+        cudaFree(q); cudaFree(c); cudaFree(o1); cudaFree(o2);
+    }
     std::printf("selftest: %d mismatches\n", bad);
     return bad ? 1 : 0;
 }
