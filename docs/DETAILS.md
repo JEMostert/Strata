@@ -98,6 +98,25 @@ as well (#410): the PCIe share of the missed experts (computed on the GPU instea
 answer after a start differ from the next ones. Measured here (IQ3_XXS, a 3.6K-token prompt, 4 repeats): with all
 three switches 1 answer of 4, without `--pcie-frac 0` 2 of 4 (the first one differs), with the defaults 2 of 4.
 `--pcie-frac 0` costs decode speed (the missed experts all run on the CPU), so keep it for A/B runs.
+`--expert-cache auto` sizes the cache from the free VRAM, which other programs change between starts; for repeats on
+a desktop that shares its GPU, also give a fixed `--expert-cache N` (two starts with 10.73 and 11.05 GiB free cached
+7,044 and 7,268 experts and answered differently from token 41 on).
+
+**Balanced PCIe share (after 0.1.39):** without `--pcie-frac` the engine now balances the share of the missed experts
+the GPU reads over PCIe while it decodes, starting from the link probe's value. After each layer's CPU experts it looks
+whether the GPU was already waiting for them: if it was, the CPU was the slower side and the share grows; if not, the
+GPU (its own work plus the PCIe share) was, and the share shrinks. The steps are weighted by what one expert costs
+each side (its copy over the probed link against the CPU's measured time per expert), and the share carries over from
+one request to the next. The probe only knows the link, but the right share also depends on the CPU: an RTX 4090 on a
+PCIe 4.0 x8 link (12.9 GB/s) with an i9-13900K (24 cores, AVX2) got 0.35 from the probe, and the GPU then waited
+~13 ms of a 27 ms window for those copies; balanced, the share settles at 0.00-0.06. IQ2_XS, 512-token answers
+through the server, 3 prompts (short code task, 4.8K-token code review, essay): 116.5 / 110.4 / 105.6 -> 142.9 / 118.1
+/ 114.8 tokens/s with 5 GB of VRAM held by another program (7,200 cached experts); with the whole card free (10,500
+cached experts), two interleaved rounds each, 147.0, 144.0 / 138.6, 135.0 / 121.8, 126.6 -> 166.6, 173.2 / 147.4,
+152.6 / 131.0, 134.1. A given `--pcie-frac` (or a request's `pcie_frac`) is used as given; `STRATA_PCIE_ADAPT=0`
+keeps the probe's share. The GDN layers' gate and alpha/beta projections also run beside the qkv projection on a
+second stream now (the same kernels and inputs: with a fixed cache and `--pcie-frac 0` the answer is identical to
+0.1.39's; `STRATA_GDN_FORK=0` turns it off).
 
 **The draft layer's tokens (0.1.27, `--draft-vocab`):** the MTP draft layer can only propose tokens from a subset
 of the vocabulary (`mtp/rt/draft_vocab.bin`). Since 0.1.27 the subset includes every Chinese, Japanese and Korean

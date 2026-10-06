@@ -2035,10 +2035,16 @@ int main(int argc, char** argv) {
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
     // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    // the automatic share is balanced while decoding from where the probe puts it (ExpertDispatch::pcie_adapt);
+    // a --pcie-frac on the command line is kept as given.  STRATA_PCIE_ADAPT=0: the probe's share, fixed.
+    const bool pcie_adapt = o.pcie_frac < 0.0 && native_pack &&
+                            !(std::getenv("STRATA_PCIE_ADAPT") && std::getenv("STRATA_PCIE_ADAPT")[0] == '0');
+    double pcie_probe_gbps = 0.0;
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
         const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+        pcie_probe_gbps = bw > 0.0 ? bw : 0.0;
         if (!native_pack) {
             o.pcie_frac = base;
         } else if (bw > 0.0) {
@@ -5433,6 +5439,10 @@ int main(int argc, char** argv) {
         }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.pcie_adapt = pcie_adapt && o.layer_split.empty();
+        drive.d.pcie_q = drive.d.pcie_num * 16;
+        drive.d.pcie_q_max = std::max(drive.d.pcie_q, (int) (0.55 * 4096.0));
+        drive.d.pcie_gbps = pcie_probe_gbps;
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
@@ -6953,6 +6963,8 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            // a request's own pcie_frac is used as given; otherwise the balanced share carries on from the last one
+            drive.d.pcie_adapt = pcie_adapt && o.layer_split.empty() && req_pcie_frac == o.pcie_frac;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
@@ -7208,6 +7220,9 @@ int main(int argc, char** argv) {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                if (drive.d.pcie_adapt)
+                    std::fprintf(stderr, "strata decode timing: balanced PCIe share now %.3f of the misses\n",
+                                 drive.d.pcie_q / 4096.0);
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());
             }
@@ -7850,6 +7865,10 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        drive.d.pcie_adapt = pcie_adapt && o.layer_split.empty();
+        drive.d.pcie_q = drive.d.pcie_num * 16;
+        drive.d.pcie_q_max = std::max(drive.d.pcie_q, (int) (0.55 * 4096.0));
+        drive.d.pcie_gbps = pcie_probe_gbps;
         const int64_t pcie0 = drive.d.pcie_experts;
         // CS-T: the file tier since the decode began (the prompt path's copies are before this)
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
@@ -8166,7 +8185,12 @@ int main(int argc, char** argv) {
                             src.file_reads() > files0 ? 100.0 * (double) src.warmed_hits() / (double) (src.file_reads() - files0) : 0.0,
                             rounds > 0 ? drive.d.lookahead->busy_ms() / rounds : 0.0, (long long) drive.d.lookahead->skipped());
         }
-        if (rounds > 0 && drive.d.pcie_num > 0)
+        if (rounds > 0 && drive.d.pcie_adapt)
+            std::printf("%-24s %.2f distinct experts per layer read over PCIe (balanced share now %.3f of the misses, "
+                        "started at %d/256)\n", "pcie experts",
+                        (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers), drive.d.pcie_q / 4096.0,
+                        drive.d.pcie_num);
+        else if (rounds > 0 && drive.d.pcie_num > 0)
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
                         drive.d.pcie_num);

@@ -229,6 +229,10 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// The GPU's arrival at its wait for this layer's CPU rows (a mapped word it stores `arrive_ring` into), so the
+    /// pool can tell which side of the layer was the slower one.  `arrive_ring` 0: not marked for this layer.
+    const uint32_t* gpu_arrive = nullptr;
+    uint32_t arrive_ring = 0;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
@@ -351,6 +355,19 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
+    /// The automatic PCIe share (no --pcie-frac), balanced while decoding: `pcie_q`/4096 of the misses go over PCIe,
+    /// and after each layer's CPU experts it moves one step up when the GPU was already waiting for the CPU's rows
+    /// (the CPU was the slower side) and one step down when it was not (the GPU, busy with its own work and the PCIe
+    /// share, was).  The startup probe only knows the link; the right share also depends on how fast the CPU is
+    /// (a 24-core CPU on an x8 link wants almost none, a 6-core one on x16 about half).  Kept across requests.
+    /// The steps are weighted by what one expert costs each side: an expert too many on PCIe costs the GPU its copy
+    /// (blob / link), one too many on the CPU costs the CPU's time per expert (measured), so the share settles
+    /// where the GPU waits for the CPU in cpu/(cpu + copy) of the layers, not at an even split.
+    bool pcie_adapt = false;
+    int pcie_q = 0, pcie_q_max = 0;
+    int64_t pcie_acc = 0;          ///< the fractional expert carried to the next layer (units of 1/4096)
+    double pcie_gbps = 0.0;        ///< the probed host->device link (0: unknown, even steps)
+    double pcie_cpu_ms = 0.0;      ///< the CPU's time per missed expert, a running average
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.

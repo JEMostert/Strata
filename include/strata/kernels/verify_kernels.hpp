@@ -36,8 +36,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
-/// outstanding at once (the split verify window keeps two).
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// outstanding at once (the split verify window keeps two).  `arrive` (a mapped host word, optional): the kernel
+/// stores `value` there when it starts waiting, so the host can tell whether the GPU had to wait for it.
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint32_t* arrive = nullptr);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 
