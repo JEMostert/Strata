@@ -517,7 +517,7 @@ __global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, i
     __shared__ float tile[TILE][LAT];
     const int t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int h = blockIdx.x * 8 + warp;
-    const int64_t n_vis = ((p0 + t + 1) / kpool) * kpool;
+    const int64_t n_vis = p0 + t + 1;   // complete pools + the tail (the token itself included): see mla_attend_rows
     float q[PER], acc[PER];
     const float* qh = q_abs + ((size_t) t * n_head + h) * LAT;
     for (int i = 0; i < PER; ++i) { q[i] = qh[lane + 32 * i]; acc[i] = 0.0f; }

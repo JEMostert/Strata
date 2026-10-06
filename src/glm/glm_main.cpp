@@ -616,12 +616,14 @@ struct Engine {
             G::kpool_key(ik_cache[il] + (size_t) p0 * M.ix_dim, ig_cache[il] + (size_t) p0 * M.ix_dim, L.ix_ape.f(),
                          pool_cache[il] + (size_t) (p0 / M.kpool) * M.ix_dim, M.kpool, M.ix_dim, st);
         }
-        // visible: the complete pools ending at or before this token (no tail selection)
+        // visible: the complete pools ending at or before this token (all of them while they are within the
+        // indexer's top-k) plus the incomplete tail up to the token itself (llama.cpp's indexer_kpool_select_tail
+        // defaults to true and the GGUF does not set it): every position 0..pos
         const int64_t n_pool_vis = (pos + 1) / M.kpool;
         if (n_pool_vis > M.ix_topk / M.kpool)
             throw std::runtime_error("contexts past " + std::to_string(M.ix_topk) +
                                      " tokens need the indexer's top-k selection (not implemented yet)");
-        const int n_vis = (int) (n_pool_vis * M.kpool);
+        const int n_vis = (int) (pos + 1);
         G::mla_attend(qabs, lc, n_vis, H, M.kv_lora, 1.0f / std::sqrt((float) M.dk_mla), olat, scores, st);
         // per-head value: W_vb[h] (dv outputs from kv_lora inputs)
         K::native_quantize_q8_1(olat, xq, M.kv_lora * H, 1, st);

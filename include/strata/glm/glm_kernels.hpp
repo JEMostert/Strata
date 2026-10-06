@@ -88,7 +88,9 @@ void kda_scan(float* S, const float* q, const float* k, const float* v, const fl
 void layer_norm_rows(const float* x, const float* w, const float* b, float* y, int rows, int n, float eps,
                      void* stream);
 /// Nope-MLA attention for T consecutive queries at positions p0.. over the latent cache: query t sees the complete
-/// pools of `kpool` tokens ending at or before p0 + t (no tail). q_abs, out: [T][n_head][lat]. n_head % 8 == 0.
+/// pools of `kpool` tokens ending at or before p0 + t and the incomplete tail up to itself (llama.cpp's
+/// indexer_kpool_select_tail, true by default), so below the indexer's top-k every position 0..p0+t.
+/// q_abs, out: [T][n_head][lat]. n_head % 8 == 0.
 void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
                      float scale, float* out, void* stream);
 /// The k-pool keys of pools [pool0, pool0 + n) from the key/gate caches ([pos][dim]) into pooled [pool][dim].
