@@ -348,7 +348,7 @@ struct Engine {
         float* lc = lat_cache[il];
         G::rms_norm_rows(lat, L.kva_norm.f(), lc + (size_t) pos * M.kv_lora, 1, M.kv_lora, M.eps_rms, st);
         // absorbed query: per head, q_abs = W_kb[h] q[h] (kv_lora outputs from dk inputs)
-        K::native_quantize_q8_1(q, xq, M.dk_mla, H, st);
+        K::native_quantize_q8_1(q, xq, M.dk_mla * H, 1, st);   // one vector: no block crosses a head
         const size_t qrow = K::native_q8_1_bytes(M.dk_mla, 1);
         const size_t kb_head = L.kb.bytes / H;
         for (int hh = 0; hh < H; ++hh)
@@ -371,7 +371,7 @@ struct Engine {
         const int n_vis = (int) (n_pool_vis * M.kpool);
         G::mla_attend(qabs, lc, n_vis, H, M.kv_lora, 1.0f / std::sqrt((float) M.dk_mla), olat, scores, st);
         // per-head value: W_vb[h] (dv outputs from kv_lora inputs)
-        K::native_quantize_q8_1(olat, xq, M.kv_lora, H, st);
+        K::native_quantize_q8_1(olat, xq, M.kv_lora * H, 1, st);
         const size_t orow = K::native_q8_1_bytes(M.kv_lora, 1);
         const size_t vb_head = L.vb.bytes / H;
         for (int hh = 0; hh < H; ++hh)
