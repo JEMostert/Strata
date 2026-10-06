@@ -948,7 +948,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 }
 
 namespace {
-__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value, volatile uint32_t* arrive) {
+    if (arrive != nullptr) *arrive = value;   // tell the host the GPU is here (it balances the PCIe share on it)
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
@@ -1174,8 +1175,8 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     check("copy_or_zero_from_mapped");
 }
 
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream, uint32_t* arrive) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, arrive);
     check("wait_flag_ge");
 }
 

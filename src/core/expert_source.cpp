@@ -2469,8 +2469,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
-        const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        const bool pcie_ok = (d.pcie_adapt ? d.pcie_q > 0 : d.pcie_num > 0) && d.src->pcie_layer(d.layers);
+        int m = 0;
+        if (pcie_ok && d.pcie_adapt) {   // the exact share on average: the remainder carries to the next layer
+            const int64_t a = (int64_t) nmiss * d.pcie_q + d.pcie_acc;
+            m = (int) (a >> 12);
+            d.pcie_acc = a - ((int64_t) m << 12);
+        } else if (pcie_ok) {
+            m = (nmiss * d.pcie_num) >> 8;
+        }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -2672,6 +2679,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     const auto c4 = std::chrono::steady_clock::now();
     pt("ran");
+    // the automatic PCIe share: one step toward the point where the CPU's rows land as the GPU reaches its wait
+    if (d.pcie_adapt && njobs > 0 && d.plan != nullptr && d.plan->gpu_arrive != nullptr && d.plan->arrive_ring != 0) {
+        constexpr int kStep = 16;   // 1/256 of the misses: the mean of the two steps
+        const bool gpu_waited = *(const volatile uint32_t*) d.plan->gpu_arrive >= d.plan->arrive_ring;
+        const double per = std::chrono::duration<double, std::milli>(c4 - c1).count() / njobs;
+        d.pcie_cpu_ms = d.pcie_cpu_ms > 0.0 ? 0.97 * d.pcie_cpu_ms + 0.03 * per : per;
+        const double cpu = d.pcie_cpu_ms;
+        const double copy = d.pcie_gbps > 0.0 ? (double) lay.blob_bytes(d.layers) / (d.pcie_gbps * 1e6) : cpu;
+        const double sum = cpu + copy > 0.0 ? cpu + copy : 1.0;
+        const int up = std::max(1, (int) (2.0 * kStep * cpu / sum + 0.5));
+        const int down = std::max(1, (int) (2.0 * kStep * copy / sum + 0.5));
+        d.pcie_q = std::clamp(d.pcie_q + (gpu_waited ? up : -down), 0, d.pcie_q_max);
+    }
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     d.ms_plan += ms(c0, c1);
     d.ms_actq += ms(c1, c2);
