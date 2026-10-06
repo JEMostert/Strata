@@ -457,6 +457,7 @@ struct Engine {
     std::vector<uint8_t> nact;               // per-token quantized activations for the CPU
     uint8_t* stage_blob = nullptr;           // one expert blob on the device (the pack layout)
     double cpu_gbps = 16.0;                  // the CPU's measured rate, blob bytes per pass per second (EMA)
+    double cpu_bias = 1.0;                   // feedback on the split: >1 when the CPU side took longer than the model said
     double gpu_gbps_pinned = 7.0, gpu_gbps_mapped = 4.5;
     bool cpu_share = true;
     int64_t n_cpu_experts = 0, n_gpu_experts = 0;
@@ -690,7 +691,7 @@ struct Engine {
             std::sort(order.begin(), order.end(), [&](int a, int b) { return count[a + 1] - count[a] < count[b + 1] - count[b]; });
             double gpu_ms = 0, cpu_ms = 0;
             auto gcost = [&](int e) { return pk->lay[il].blob / 1e6 / (pk->is_pinned[(size_t) il * M.n_expert + e] ? gpu_gbps_pinned : gpu_gbps_mapped); };
-            auto ccost = [&](int e) { return (double) ((count[e + 1] - count[e] + C::MAXT - 1) / C::MAXT) * pk->lay[il].blob / 1e6 / cpu_gbps; };
+            auto ccost = [&](int e) { return cpu_bias * (double) ((count[e + 1] - count[e] + C::MAXT - 1) / C::MAXT) * pk->lay[il].blob / 1e6 / cpu_gbps; };
             for (int e : order) gpu_ms += gcost(e);
             for (int e : order) {
                 const double g2 = gpu_ms - gcost(e), c2 = cpu_ms + ccost(e);
@@ -735,11 +736,20 @@ struct Engine {
                 expert_product(L.ed.type, wd, F, E, dbytes, exq2, n, bye);
                 G::scatter_scaled(bye, rdst + r0, rdst + r0, bw, bparts, n, E, st);
             }
+            ck(cudaStreamSynchronize(st), "gpu experts");
         };
         const auto c0 = std::chrono::steady_clock::now();
-        std::thread gpu_thread(gpu_side);
+        double gpu_side_ms = 0;
+        std::thread gpu_thread([&]() {
+            gpu_side();
+            gpu_side_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+        });
         cpu_experts(il, cpu_list, htok);
+        const double cpu_side_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         gpu_thread.join();
+        // feedback: the side that finished last gets less next layer (the cost model's error, smoothed)
+        if (!cpu_list.empty() && gpu_side_ms > 1.0 && cpu_side_ms > 1.0)
+            cpu_bias = std::min(4.0, std::max(0.25, cpu_bias * std::sqrt(cpu_side_ms / gpu_side_ms)));
         ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
         // the CPU's rows to the device, weighted into their slots
         for (const auto& c : cpu_list) {

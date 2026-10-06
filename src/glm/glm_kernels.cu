@@ -2,10 +2,12 @@
 #include "strata/glm/glm_kernels.hpp"
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cfloat>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -706,6 +708,156 @@ __global__ void ix_select_kernel(const float* scores, int64_t p0, int kpool, int
     }
 }
 
+
+// ---- MLA attention on tensor cores (mma.sync m16n8k16, f16 in, f32 accumulate - llama.cpp's flash attention reads
+// its f16 cache the same way). Block = one query x 16 heads; the query's visible positions (the selected pools and
+// the tail, or every position while all pools fit the top-k) are first gathered into an ordered list, then the
+// latents are processed in tiles of 32: S = Q K^T, an online softmax per row, O += P V (V = K: the latent).
+constexpr int kAttnRows = 16, kAttnTile = 32, kAttnMaxList = 2048 + 64;
+
+__device__ __forceinline__ uint32_t pack_h2(__half lo, __half hi) {
+    const __half2 v = __halves2half2(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+__device__ __forceinline__ void mma16816(float c[4], const uint32_t a[4], const uint32_t b[2]) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+template <int LAT>
+__global__ void __launch_bounds__(128) mla_attn_tc_kernel(const float* q_abs, const float* cache, int64_t p0, int n_head,
+                                                          int kpool, float scale, float* out, const uint8_t* sel,
+                                                          int64_t sel_ld) {
+    constexpr int R = kAttnRows, KT = kAttnTile, NT = LAT / 4 / 8;   // n-tiles of 8 dims per warp (4 warps)
+    extern __shared__ __align__(16) unsigned char smem[];
+    __half* Qs = (__half*) smem;
+    __half* Ks = Qs + R * LAT;
+    float* Ss = (float*) (Ks + KT * LAT);
+    __half* Ps = (__half*) (Ss + R * KT);
+    float* mrow = (float*) (Ps + R * KT);
+    float* lrow = mrow + R;
+    float* crow = lrow + R;
+    int* list = (int*) (crow + R);
+    int* scan = list + kAttnMaxList;
+    const int t = blockIdx.y, h0 = blockIdx.x * R;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
+    const float* qsrc = q_abs + ((size_t) t * n_head + h0) * LAT;
+    for (int i = tid; i < R * LAT; i += blockDim.x) Qs[i] = __float2half(qsrc[i]);
+    // the visible positions, in order
+    const int64_t pos = p0 + t;
+    const int64_t tail0 = ((pos + 1) / kpool) * kpool;
+    int n_list = 0;
+    if (!sel) {
+        n_list = (int) (pos + 1);
+        for (int i = tid; i < n_list; i += blockDim.x) list[i] = i;
+    } else {
+        const int64_t np = tail0 / kpool;
+        const int64_t per = (np + blockDim.x - 1) / blockDim.x;
+        const int64_t a = min(np, (int64_t) tid * per), b = min(np, a + per);
+        const uint8_t* sr = sel + (size_t) t * sel_ld;
+        int cnt = 0;
+        for (int64_t j = a; j < b; ++j) cnt += sr[j] ? kpool : 0;
+        scan[tid] = cnt;
+        __syncthreads();
+        if (tid == 0) {
+            int run = 0;
+            for (int i = 0; i < (int) blockDim.x; ++i) { const int v = scan[i]; scan[i] = run; run += v; }
+            scan[blockDim.x] = run;
+        }
+        __syncthreads();
+        int at = scan[tid];
+        for (int64_t j = a; j < b; ++j)
+            if (sr[j]) for (int r = 0; r < kpool; ++r) list[at++] = (int) (j * kpool + r);
+        n_list = scan[blockDim.x];
+        __syncthreads();
+        for (int64_t p = tail0 + tid; p <= pos; p += blockDim.x) list[n_list + (int) (p - tail0)] = (int) p;
+        n_list += (int) (pos + 1 - tail0);
+    }
+    if (tid < R) { mrow[tid] = -FLT_MAX; lrow[tid] = 0.0f; }
+    float acc[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+    __syncthreads();
+    for (int s0 = 0; s0 < n_list; s0 += KT) {
+        const int nk = min(KT, n_list - s0);
+        for (int i = tid; i < KT * LAT; i += blockDim.x) {
+            const int r = i / LAT, col = i - r * LAT;
+            Ks[i] = r < nk ? __float2half(cache[(size_t) list[s0 + r] * LAT + col]) : __float2half(0.0f);
+        }
+        __syncthreads();
+        {   // S: warp w computes latents [8w, 8w + 8) for the 16 rows
+            float c[4] = {0.f, 0.f, 0.f, 0.f};
+            const __half* krow = Ks + (size_t) (8 * warp + gid) * LAT;
+#pragma unroll 4
+            for (int kk = 0; kk < LAT; kk += 16) {
+                uint32_t a[4], b[2];
+                a[0] = pack_h2(Qs[gid * LAT + kk + tig * 2], Qs[gid * LAT + kk + tig * 2 + 1]);
+                a[1] = pack_h2(Qs[(gid + 8) * LAT + kk + tig * 2], Qs[(gid + 8) * LAT + kk + tig * 2 + 1]);
+                a[2] = pack_h2(Qs[gid * LAT + kk + tig * 2 + 8], Qs[gid * LAT + kk + tig * 2 + 9]);
+                a[3] = pack_h2(Qs[(gid + 8) * LAT + kk + tig * 2 + 8], Qs[(gid + 8) * LAT + kk + tig * 2 + 9]);
+                b[0] = pack_h2(krow[kk + tig * 2], krow[kk + tig * 2 + 1]);
+                b[1] = pack_h2(krow[kk + tig * 2 + 8], krow[kk + tig * 2 + 9]);
+                mma16816(c, a, b);
+            }
+            Ss[gid * KT + 8 * warp + tig * 2] = c[0] * scale;
+            Ss[gid * KT + 8 * warp + tig * 2 + 1] = c[1] * scale;
+            Ss[(gid + 8) * KT + 8 * warp + tig * 2] = c[2] * scale;
+            Ss[(gid + 8) * KT + 8 * warp + tig * 2 + 1] = c[3] * scale;
+        }
+        __syncthreads();
+        for (int r = warp * 4; r < warp * 4 + 4; ++r) {   // online softmax, a warp per row, a lane per latent
+            const float v = lane < nk ? Ss[r * KT + lane] : -FLT_MAX;
+            const float mx = warp_max(v);
+            const float mo = mrow[r];
+            const float mn = fmaxf(mo, mx);
+            const float p = lane < nk ? expf(v - mn) : 0.0f;
+            const float sum = warp_sum(p);
+            Ps[r * KT + lane] = __float2half(p);
+            if (lane == 0) {
+                const float corr = mo == -FLT_MAX ? 0.0f : expf(mo - mn);
+                crow[r] = corr;
+                lrow[r] = lrow[r] * corr + sum;
+                mrow[r] = mn;
+            }
+        }
+        __syncthreads();
+        {   // O = O * corr + P V; warp w owns dims [LAT/4 w, LAT/4 (w+1))
+            const float c0 = crow[gid], c1 = crow[gid + 8];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) { acc[n][0] *= c0; acc[n][1] *= c0; acc[n][2] *= c1; acc[n][3] *= c1; }
+#pragma unroll
+            for (int ks = 0; ks < KT; ks += 16) {
+                uint32_t a[4];
+                a[0] = pack_h2(Ps[gid * KT + ks + tig * 2], Ps[gid * KT + ks + tig * 2 + 1]);
+                a[1] = pack_h2(Ps[(gid + 8) * KT + ks + tig * 2], Ps[(gid + 8) * KT + ks + tig * 2 + 1]);
+                a[2] = pack_h2(Ps[gid * KT + ks + tig * 2 + 8], Ps[gid * KT + ks + tig * 2 + 9]);
+                a[3] = pack_h2(Ps[(gid + 8) * KT + ks + tig * 2 + 8], Ps[(gid + 8) * KT + ks + tig * 2 + 9]);
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const int d = warp * (LAT / 4) + n * 8 + gid;
+                    uint32_t b[2];
+                    b[0] = pack_h2(Ks[(ks + tig * 2) * LAT + d], Ks[(ks + tig * 2 + 1) * LAT + d]);
+                    b[1] = pack_h2(Ks[(ks + tig * 2 + 8) * LAT + d], Ks[(ks + tig * 2 + 9) * LAT + d]);
+                    mma16816(acc[n], a, b);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const float i0 = lrow[gid] > 0.f ? 1.0f / lrow[gid] : 0.0f, i1 = lrow[gid + 8] > 0.f ? 1.0f / lrow[gid + 8] : 0.0f;
+    float* o0 = out + ((size_t) t * n_head + h0 + gid) * LAT;
+    float* o1 = out + ((size_t) t * n_head + h0 + gid + 8) * LAT;
+#pragma unroll
+    for (int n = 0; n < NT; ++n) {
+        const int d = warp * (LAT / 4) + n * 8 + tig * 2;
+        o0[d] = acc[n][0] * i0;
+        o0[d + 1] = acc[n][1] * i0;
+        o1[d] = acc[n][2] * i1;
+        o1[d + 1] = acc[n][3] * i1;
+    }
+}
+
 __global__ void kpool_keys_kernel(const float* key_cache, const float* gate_cache, const float* ape, float* pooled,
                                   int64_t pool0, int kpool, int dim) {
     const int64_t pool = pool0 + blockIdx.y;
@@ -943,7 +1095,18 @@ void ix_select(const float* scores, int64_t p0, int T, int kpool, int64_t n_pool
 }
 void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
                      float scale, float* out, void* stream, const uint8_t* sel, int64_t sel_ld) {
-    if (lat != 512 || n_head % 8) throw std::runtime_error("mla_attend_rows: built for 512-wide latents, 8k heads");
+    if (lat != 512 || n_head % 16) throw std::runtime_error("mla_attend_rows: built for 512-wide latents, 16k heads");
+    static const bool tc = [] { const char* v = std::getenv("STRATA_GLM_ATTN_TC"); return !v || v[0] != '0'; }();
+    if (tc) {   // STRATA_GLM_ATTN_TC=0: the f32 kernel below
+        const size_t sh = (size_t) kAttnRows * 512 * 2 + (size_t) kAttnTile * 512 * 2 + kAttnRows * kAttnTile * 4 +
+                          kAttnRows * kAttnTile * 2 + 3 * kAttnRows * 4 + (kAttnMaxList + 129) * 4;
+        static bool attr = false;
+        if (!attr) { cudaFuncSetAttribute(mla_attn_tc_kernel<512>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sh); attr = true; }
+        mla_attn_tc_kernel<512><<<dim3(n_head / kAttnRows, T), 128, sh, (cudaStream_t) stream>>>(q_abs, cache, p0, n_head,
+                                                                                               kpool, scale, out, sel, sel_ld);
+        check("mla_attn_tc");
+        return;
+    }
     if (T >= 4)
         mla_attend_rows_kernel<512, 4><<<dim3(n_head / 8, (T + 3) / 4), 256, 0, (cudaStream_t) stream>>>(
             q_abs, cache, p0, T, n_head, kpool, scale, out, sel, sel_ld);
