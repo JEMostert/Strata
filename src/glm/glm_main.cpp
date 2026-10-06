@@ -613,6 +613,27 @@ struct Engine {
         const uint8_t* sel = indexer(L, il, bh, bqr, p0, T);
         G::mla_attend_rows(bqabs, lat_cache[il], p0, T, H, M.kv_lora, M.kpool, 1.0f / std::sqrt((float) M.dk_mla), bolat, st,
                            sel, sel ? n_pools() : 0);
+        static const bool cmp = std::getenv("STRATA_GLM_ATTN_CMP") != nullptr;
+        if (cmp) {   // debug: the f32 kernel on the same inputs, and the sizes involved
+            const size_t n = (size_t) T * H * M.kv_lora;
+            float* ref = dalloc(n);
+            setenv("STRATA_GLM_ATTN_TC", "0", 1);
+            G::mla_attend_rows(bqabs, lat_cache[il], p0, T, H, M.kv_lora, M.kpool, 1.0f / std::sqrt((float) M.dk_mla), ref,
+                               st, sel, sel ? n_pools() : 0);
+            setenv("STRATA_GLM_ATTN_TC", "1", 1);
+            std::vector<float> a1(n), a2(n), qa(n);
+            ck(cudaMemcpy(a1.data(), bolat, n * 4, cudaMemcpyDeviceToHost), "cmp");
+            ck(cudaMemcpy(a2.data(), ref, n * 4, cudaMemcpyDeviceToHost), "cmp");
+            ck(cudaMemcpy(qa.data(), bqabs, n * 4, cudaMemcpyDeviceToHost), "cmp");
+            double md = 0, mx = 0, qmx = 0;
+            for (size_t i = 0; i < n; ++i) {
+                md = std::max(md, (double) std::fabs(a1[i] - a2[i]));
+                mx = std::max(mx, (double) std::fabs(a2[i]));
+                qmx = std::max(qmx, (double) std::fabs(qa[i]));
+            }
+            std::printf("  attn cmp layer %d: max |tc - f32| %.4g of max |o| %.4g; max |q_abs| %.4g\n", il, md, mx, qmx);
+            cudaFree(ref);
+        }
         for (int hh = 0; hh < H; ++hh)
             gm(L.vb, (const uint8_t*) L.vb.d + hh * vb_head, vb_head, M.kv_lora, M.dv_mla, bolat + (size_t) hh * M.kv_lora,
               (int64_t) H * M.kv_lora, T, bvh + (size_t) hh * M.dv_mla, (int64_t) H * M.dv_mla);

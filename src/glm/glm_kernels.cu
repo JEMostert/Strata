@@ -1096,7 +1096,8 @@ void ix_select(const float* scores, int64_t p0, int T, int kpool, int64_t n_pool
 void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
                      float scale, float* out, void* stream, const uint8_t* sel, int64_t sel_ld) {
     if (lat != 512 || n_head % 16) throw std::runtime_error("mla_attend_rows: built for 512-wide latents, 16k heads");
-    static const bool tc = [] { const char* v = std::getenv("STRATA_GLM_ATTN_TC"); return !v || v[0] != '0'; }();
+    const char* tcv = std::getenv("STRATA_GLM_ATTN_TC");
+    const bool tc = !tcv || tcv[0] != '0';
     if (tc) {   // STRATA_GLM_ATTN_TC=0: the f32 kernel below
         const size_t sh = (size_t) kAttnRows * 512 * 2 + (size_t) kAttnTile * 512 * 2 + kAttnRows * kAttnTile * 4 +
                           kAttnRows * kAttnTile * 2 + 3 * kAttnRows * 4 + (kAttnMaxList + 129) * 4;
