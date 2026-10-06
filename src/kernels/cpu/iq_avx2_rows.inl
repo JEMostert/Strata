@@ -161,7 +161,7 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     for (int r = r0; r < r1; ++r) {
         row_dot_any<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
         row_dot_any<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
-        for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+        for (int t = 0; t < NT; ++t) ff[t][r] = strata::kernels::cpu::swiglu(g[t], u[t]);
     }
 }
 

@@ -13,11 +13,15 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses (GLM-5.3-Flash's 4096 values as Q8_K: 16 x 292;
+/// Qwen3.8's 2560: 10 x 292).
+inline constexpr size_t kNativeActBytes = 8192;
+/// Bytes of the largest quantized down activation (GLM-5.3-Flash's 2048 values as Q8_K: 8 x 292; Qwen3.8's 640 as
+/// Q8_0: 20 x 34, or Q8_K 3 x 292).
+inline constexpr size_t kNativeHBytes = 4096;
 
+/// The widest native expert intermediate the pool's buffers hold (GLM-5.3-Flash's 2048; Qwen3.8's is 640).
+inline constexpr int kNativeMaxFF = 2048;
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
