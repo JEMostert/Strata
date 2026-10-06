@@ -1,6 +1,7 @@
 // src/glm/glm_kernels.cu - see include/strata/glm/glm_kernels.hpp. Correctness first: plain kernels, one token.
 #include "strata/glm/glm_kernels.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -502,6 +503,56 @@ __global__ void kda_scan_kernel(float* S, const float* q, const float* k, const 
     }
 }
 
+// The scan with the state in registers: head = block, row j = tid / 4, its quarter q = tid % 4 holds S[32q..32q+31][j].
+// Per token: decay, the row's dot with k (4 partial sums, shuffle-reduced), the delta update, the dot with q.
+template <int D>
+__global__ void __launch_bounds__(4 * D) kda_scan_reg_kernel(float* S, const float* q, const float* k, const float* v,
+                                                             const float* g, const float* beta, float* out, int n_head,
+                                                             int T) {
+    constexpr int P = D / 4;
+    const int h = blockIdx.x, tid = threadIdx.x, j = tid >> 2, qt = tid & 3;
+    __shared__ float eg[2][D], kk[2][D], qq[2][D];
+    float s[P];
+    float* row = S + ((size_t) h * D + j) * D + qt * P;
+#pragma unroll
+    for (int i = 0; i < P; ++i) s[i] = row[i];
+    const float inv = rsqrtf((float) D);
+    auto load = [&](int t_, int buf) {
+        const size_t base = ((size_t) t_ * n_head + h) * D;
+        if (tid < D) eg[buf][tid] = expf(g[base + tid]);
+        else if (tid < 2 * D) kk[buf][tid - D] = k[base + tid - D];
+        else if (tid < 3 * D) qq[buf][tid - 2 * D] = q[base + tid - 2 * D];
+    };
+    if (T > 0) load(0, 0);
+    __syncthreads();
+    for (int t_ = 0; t_ < T; ++t_) {
+        const int b = t_ & 1;
+        if (t_ + 1 < T) load(t_ + 1, b ^ 1);
+        const size_t base = ((size_t) t_ * n_head + h) * D;
+        float part = 0.0f;
+#pragma unroll
+        for (int i = 0; i < P; ++i) {
+            s[i] *= eg[b][qt * P + i];
+            part += s[i] * kk[b][qt * P + i];
+        }
+        part += __shfl_xor_sync(0xffffffffu, part, 1);
+        part += __shfl_xor_sync(0xffffffffu, part, 2);
+        const float delta = (v[base + j] - part) * beta[(size_t) t_ * n_head + h];
+        float o = 0.0f;
+#pragma unroll
+        for (int i = 0; i < P; ++i) {
+            s[i] += kk[b][qt * P + i] * delta;
+            o += s[i] * qq[b][qt * P + i];
+        }
+        o += __shfl_xor_sync(0xffffffffu, o, 1);
+        o += __shfl_xor_sync(0xffffffffu, o, 2);
+        if (qt == 0) out[base + j] = o * inv;
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < P; ++i) row[i] = s[i];
+}
+
 __global__ void layer_norm_rows_kernel(const float* x, const float* w, const float* b, float* y, int n, float eps) {
     x += (size_t) blockIdx.x * n;
     y += (size_t) blockIdx.x * n;
@@ -516,53 +567,72 @@ __global__ void layer_norm_rows_kernel(const float* x, const float* w, const flo
 
 // MQA over the latent cache: block = 8 heads (one warp each) of one query token; the latents are read once per
 // block in tiles through shared memory, online softmax per head, lane-held accumulators (lat / 32 per lane).
-template <int LAT>
-__global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, int64_t p0, int n_head, int kpool,
+template <int LAT, int QB>
+__global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int kpool,
                                        float scale, float* out, const uint8_t* sel, int64_t sel_ld) {
+    // block = 8 heads (a warp each) of QB consecutive queries; each latent tile is read once for all of them
     constexpr int TILE = 16, PER = LAT / 32;
     __shared__ float tile[TILE][LAT];
-    const int t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int h = blockIdx.x * 8 + warp;
-    const int64_t n_vis = p0 + t + 1;   // complete pools + the tail (the token itself included): see mla_attend_rows
-    const int64_t tail0 = ((p0 + t + 1) / kpool) * kpool;   // positions from here on are the tail, always seen
-    const uint8_t* srow = sel ? sel + (size_t) t * sel_ld : nullptr;
-    float q[PER], acc[PER];
-    const float* qh = q_abs + ((size_t) t * n_head + h) * LAT;
-    for (int i = 0; i < PER; ++i) { q[i] = qh[lane + 32 * i]; acc[i] = 0.0f; }
-    float m = -FLT_MAX, z = 0.0f;
-    for (int64_t t0 = 0; t0 < n_vis; t0 += TILE) {
-        const int nt = (int) min((int64_t) TILE, n_vis - t0);
+    const int tq0 = blockIdx.y * QB;
+    const int nq = min(QB, T - tq0);
+    float q[QB][PER], acc[QB][PER], m[QB], z[QB];
+    int64_t n_vis[QB], tail0[QB];
+    const uint8_t* srow[QB];
+#pragma unroll
+    for (int a = 0; a < QB; ++a) {
+        const int t = tq0 + (a < nq ? a : 0);
+        n_vis[a] = a < nq ? p0 + t + 1 : 0;   // complete pools + the tail up to the query itself
+        tail0[a] = ((p0 + t + 1) / kpool) * kpool;
+        srow[a] = sel ? sel + (size_t) t * sel_ld : nullptr;
+        const float* qh = q_abs + ((size_t) t * n_head + h) * LAT;
+        for (int i = 0; i < PER; ++i) { q[a][i] = qh[lane + 32 * i]; acc[a][i] = 0.0f; }
+        m[a] = -FLT_MAX;
+        z[a] = 0.0f;
+    }
+    const int64_t n_all = p0 + tq0 + nq;
+    for (int64_t t0 = 0; t0 < n_all; t0 += TILE) {
+        const int nt = (int) min((int64_t) TILE, n_all - t0);
         __syncthreads();
         for (int i = threadIdx.x; i < nt * LAT; i += blockDim.x)
             tile[i / LAT][i % LAT] = cache[(size_t) (t0 + i / LAT) * LAT + i % LAT];
         __syncthreads();
-        float sc[TILE];
-        float tmax = -FLT_MAX;
-        for (int l = 0; l < nt; ++l) {
-            const int64_t ps = t0 + l;
-            if (srow && ps < tail0 && !srow[ps / kpool]) { sc[l] = -FLT_MAX; continue; }   // a pool not selected
-            float s = 0.0f;
-            for (int i = 0; i < PER; ++i) s += q[i] * tile[l][lane + 32 * i];
-            s = warp_sum(s) * scale;
-            sc[l] = s;
-            tmax = fmaxf(tmax, s);
+#pragma unroll
+        for (int a = 0; a < QB; ++a) {
+            if (t0 >= n_vis[a]) continue;
+            float sc[TILE];
+            float tmax = -FLT_MAX;
+            for (int l = 0; l < nt; ++l) {
+                const int64_t ps = t0 + l;
+                if (ps >= n_vis[a] || (srow[a] && ps < tail0[a] && !srow[a][ps / kpool])) { sc[l] = -FLT_MAX; continue; }
+                float s = 0.0f;
+                for (int i = 0; i < PER; ++i) s += q[a][i] * tile[l][lane + 32 * i];
+                s = warp_sum(s) * scale;
+                sc[l] = s;
+                tmax = fmaxf(tmax, s);
+            }
+            if (tmax == -FLT_MAX) continue;
+            const float mn = fmaxf(m[a], tmax);
+            const float corr = expf(m[a] - mn);
+            z[a] *= corr;
+            for (int i = 0; i < PER; ++i) acc[a][i] *= corr;
+            for (int l = 0; l < nt; ++l) {
+                if (sc[l] == -FLT_MAX) continue;
+                const float p = expf(sc[l] - mn);
+                z[a] += p;
+                for (int i = 0; i < PER; ++i) acc[a][i] += p * tile[l][lane + 32 * i];
+            }
+            m[a] = mn;
         }
-        if (tmax == -FLT_MAX) continue;   // nothing selected in this tile
-        const float mn = fmaxf(m, tmax);
-        const float corr = expf(m - mn);
-        z *= corr;
-        for (int i = 0; i < PER; ++i) acc[i] *= corr;
-        for (int l = 0; l < nt; ++l) {
-            if (sc[l] == -FLT_MAX) continue;
-            const float p = expf(sc[l] - mn);
-            z += p;
-            for (int i = 0; i < PER; ++i) acc[i] += p * tile[l][lane + 32 * i];
-        }
-        m = mn;
     }
-    float* oh = out + ((size_t) t * n_head + h) * LAT;
-    const float inv = n_vis > 0 ? 1.0f / z : 0.0f;
-    for (int i = 0; i < PER; ++i) oh[lane + 32 * i] = acc[i] * inv;
+#pragma unroll
+    for (int a = 0; a < QB; ++a) {
+        if (a >= nq) break;
+        float* oh = out + ((size_t) (tq0 + a) * n_head + h) * LAT;
+        const float inv = n_vis[a] > 0 ? 1.0f / z[a] : 0.0f;
+        for (int i = 0; i < PER; ++i) oh[lane + 32 * i] = acc[a][i] * inv;
+    }
 }
 
 // one block per query: q (n_head x dim) and the weights in shared memory, a warp per pool
@@ -770,6 +840,11 @@ void sigmoid_inplace(float* x, int n, void* stream) {
 }
 void kda_step(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta,
               float* out, int n_head, int head_dim, void* stream) {
+    if (head_dim == 128) {   // the scan with one token: the same arithmetic as the prompt path
+        kda_scan_reg_kernel<128><<<n_head, 512, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, out, n_head, 1);
+        check("kda_step (scan)");
+        return;
+    }
     kda_step_kernel<<<n_head, head_dim, 3 * head_dim * sizeof(float), (cudaStream_t) stream>>>(S, q, k, v, g, beta,
                                                                                              out, head_dim);
     check("kda_step");
@@ -838,6 +913,11 @@ void kda_gate_rows(const float* gf, const float* dt_bias, const float* A, float*
 }
 void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* out,
               int n_head, int head_dim, int T, void* stream) {
+    if (head_dim == 128) {
+        kda_scan_reg_kernel<128><<<n_head, 512, 0, (cudaStream_t) stream>>>(S, q, k, v, g, beta, out, n_head, T);
+        check("kda_scan_reg");
+        return;
+    }
     kda_scan_kernel<<<n_head, head_dim, 3 * head_dim * sizeof(float), (cudaStream_t) stream>>>(S, q, k, v, g, beta, out,
                                                                                              n_head, head_dim, T);
     check("kda_scan");
@@ -864,8 +944,12 @@ void ix_select(const float* scores, int64_t p0, int T, int kpool, int64_t n_pool
 void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
                      float scale, float* out, void* stream, const uint8_t* sel, int64_t sel_ld) {
     if (lat != 512 || n_head % 8) throw std::runtime_error("mla_attend_rows: built for 512-wide latents, 8k heads");
-    mla_attend_rows_kernel<512><<<dim3(n_head / 8, T), 256, 0, (cudaStream_t) stream>>>(q_abs, cache, p0, n_head, kpool,
-                                                                                       scale, out, sel, sel_ld);
+    if (T >= 4)
+        mla_attend_rows_kernel<512, 4><<<dim3(n_head / 8, (T + 3) / 4), 256, 0, (cudaStream_t) stream>>>(
+            q_abs, cache, p0, T, n_head, kpool, scale, out, sel, sel_ld);
+    else
+        mla_attend_rows_kernel<512, 1><<<dim3(n_head / 8, T), 256, 0, (cudaStream_t) stream>>>(
+            q_abs, cache, p0, T, n_head, kpool, scale, out, sel, sel_ld);
     check("mla_attend_rows");
 }
 void kpool_keys(const float* key_cache, const float* gate_cache, const float* ape, float* pooled, int64_t pool0, int n,
@@ -876,6 +960,16 @@ void kpool_keys(const float* key_cache, const float* gate_cache, const float* ap
     check("kpool_keys");
 }
 void gemm_f32(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* stream) {
+    if (T >= 8) {   // cuBLAS SGEMM (plain FP32): y^T (n_out x T) = W (n_out x n_in) . x^T
+        static cublasHandle_t hb = nullptr;
+        if (!hb && cublasCreate(&hb) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublasCreate");
+        cublasSetStream(hb, (cudaStream_t) stream);
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasSgemm(hb, CUBLAS_OP_T, CUBLAS_OP_N, n_out, T, n_in, &one, W, n_in, x, n_in, &zero, y, n_out) !=
+            CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("cublasSgemm");
+        return;
+    }
     const int64_t warps = (int64_t) n_out * T;
     gemm_f32_kernel<<<(unsigned) ((warps + 7) / 8), 256, 0, (cudaStream_t) stream>>>(W, x, y, n_in, n_out, T);
     check("gemm_f32");
