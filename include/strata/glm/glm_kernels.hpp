@@ -67,6 +67,44 @@ void swiglu_clamp(const float* g, const float* u, float* out, int n, float limit
 void axpy_dev(float* y, const float* x, const float* a_dev, int n, void* stream);
 /// y += x.
 void add_inplace(float* y, const float* x, int n, void* stream);
+// ---- many tokens (the prompt path): T rows, row-major, the same maths as the one-token kernels above
+
+/// hc_read for T tokens: mixes [T][24], R [T][4][n], x [T][n], post [T][4], comb [T][16].
+void hc_read_rows(const float* mixes, const float* scale, const float* base, const float* R, float* x, float* post,
+                  float* comb, int n_embd, float eps, int iters, int T, void* stream);
+/// hc_write for T tokens (f [T][n], R [T][4][n] in place allowed).
+void hc_write_rows(const float* f, const float* R_in, const float* post, const float* comb, float* R_out, int n_embd,
+                   int T, void* stream);
+/// The KDA causal conv + SiLU over T consecutive tokens of one sequence (x, y: [T][channels]); state carried.
+void kda_conv_silu_seq(const float* x, float* state, const float* w, float* y, int channels, int k, int T,
+                       void* stream);
+/// kda_gate over T rows of n_head * head_dim.
+void kda_gate_rows(const float* gf, const float* dt_bias, const float* A, float* g, int n_head, int head_dim, int T,
+                   float lower, void* stream);
+/// The gated delta rule over T consecutive tokens (q, k, v, g, out: [T][heads][d], beta: [T][heads]).
+void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* out,
+              int n_head, int head_dim, int T, void* stream);
+/// layer_norm over `rows` rows of n.
+void layer_norm_rows(const float* x, const float* w, const float* b, float* y, int rows, int n, float eps,
+                     void* stream);
+/// Nope-MLA attention for T consecutive queries at positions p0.. over the latent cache: query t sees the complete
+/// pools of `kpool` tokens ending at or before p0 + t (no tail). q_abs, out: [T][n_head][lat]. n_head % 8 == 0.
+void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
+                     float scale, float* out, void* stream);
+/// The k-pool keys of pools [pool0, pool0 + n) from the key/gate caches ([pos][dim]) into pooled [pool][dim].
+void kpool_keys(const float* key_cache, const float* gate_cache, const float* ape, float* pooled, int64_t pool0, int n,
+                int kpool, int dim, void* stream);
+/// y [T][n_out] = x [T][n_in] W^T for an f32 W of n_out rows of n_in (the router, the indexer weights).
+void gemm_f32(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* stream);
+/// router_topk for T rows: logits [T][n_expert], ids/weights [T][k].
+void router_topk_rows(const float* logits, const float* bias, int n_expert, int k, float scale, int32_t* ids,
+                       float* weights, int T, void* stream);
+/// parts[dst[r]] = w[wi[r]] * y[r] for r < rows (y, parts: rows of n).
+void scatter_scaled(const float* y, const int32_t* dst, const int32_t* wi, const float* w, float* parts, int rows,
+                    int n, void* stream);
+/// out[t] = sum_{j<k} parts[t*k + j] + extra[t] (in j order), T rows of n.
+void sum_parts(const float* parts, const float* extra, float* out, int T, int k, int n, void* stream);
+
 /// d[i] = i for i < n.
 void iota(int32_t* d, int n, void* stream);
 /// d[0] = a, d[1] = b.

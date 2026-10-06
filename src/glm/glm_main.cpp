@@ -291,6 +291,207 @@ struct Engine {
     int32_t* d_arg = nullptr;
     bool dump = false;
 
+    // ---- the prompt path: T tokens per chunk, every layer for the whole chunk (allocated on first use)
+    int Tmax = 0;
+    std::unique_ptr<Gemm> gemm;
+    float *bR = nullptr, *bflat, *bmix, *bx, *bh, *bpost, *bcomb, *bout;
+    float *bqp, *bkp, *bvp, *bfa, *bgf, *bg, *bbeta, *bo, *bga, *bg2, *bgated;
+    float *bqa, *bqr, *bq, *blat, *bqabs, *bolat, *bvh, *bik;
+    float *blog, *bw, *bsg, *bsu, *bshared, *bparts, *bge, *bue, *bae, *bye, *bfg, *bfu;
+    int32_t *bids = nullptr, *rtok = nullptr, *rdst = nullptr, *rwi = nullptr, *e_ids = nullptr, *e_bounds = nullptr;
+    void *exq = nullptr, *exq2 = nullptr;
+    double ms_copy = 0, ms_layers = 0;
+    size_t bytes_streamed = 0;
+
+    void alloc_batch(int T) {
+        Tmax = T;
+        const int E = M.n_embd, HD = M.n_head * M.head_dim, H = M.n_head, k = M.n_used;
+        gemm = std::make_unique<Gemm>((int64_t) T * k, (int64_t) G::kHc * E, st);
+        bR = dalloc((size_t) T * G::kHc * E); bflat = dalloc((size_t) T * G::kHc * E); bmix = dalloc((size_t) T * G::kHcMix);
+        bx = dalloc((size_t) T * E); bh = dalloc((size_t) T * E); bpost = dalloc((size_t) T * G::kHc);
+        bcomb = dalloc((size_t) T * 16); bout = dalloc((size_t) T * E);
+        bqp = dalloc((size_t) T * HD); bkp = dalloc((size_t) T * HD); bvp = dalloc((size_t) T * HD);
+        bfa = dalloc((size_t) T * M.head_dim); bgf = dalloc((size_t) T * HD); bg = dalloc((size_t) T * HD);
+        bbeta = dalloc((size_t) T * H); bo = dalloc((size_t) T * HD); bga = dalloc((size_t) T * M.head_dim);
+        bg2 = dalloc((size_t) T * HD); bgated = dalloc((size_t) T * HD);
+        bqa = dalloc((size_t) T * M.q_lora); bqr = dalloc((size_t) T * M.q_lora); bq = dalloc((size_t) T * H * M.dk_mla);
+        blat = dalloc((size_t) T * M.kv_lora); bqabs = dalloc((size_t) T * H * M.kv_lora);
+        bolat = dalloc((size_t) T * H * M.kv_lora); bvh = dalloc((size_t) T * H * M.dv_mla); bik = dalloc((size_t) T * M.ix_dim);
+        blog = dalloc((size_t) T * M.n_expert); bw = dalloc((size_t) T * k);
+        bsg = dalloc((size_t) T * M.n_ff_exp); bsu = dalloc((size_t) T * M.n_ff_exp); bshared = dalloc((size_t) T * E);
+        bparts = dalloc((size_t) T * k * E);
+        bge = dalloc((size_t) T * k * M.n_ff_exp); bue = dalloc((size_t) T * k * M.n_ff_exp);
+        bae = dalloc((size_t) T * k * M.n_ff_exp); bye = dalloc((size_t) T * k * E);
+        bfg = dalloc((size_t) T * M.n_ff); bfu = dalloc((size_t) T * M.n_ff);
+        ck(cudaMalloc(&bids, (size_t) T * k * sizeof(int32_t)), "bids");
+        ck(cudaMalloc(&rtok, (size_t) T * k * sizeof(int32_t)), "rtok");
+        ck(cudaMalloc(&rdst, (size_t) T * k * sizeof(int32_t)), "rdst");
+        ck(cudaMalloc(&rwi, (size_t) T * k * sizeof(int32_t)), "rwi");
+        ck(cudaMalloc(&e_ids, (size_t) T * k * sizeof(int32_t)), "e_ids");
+        ck(cudaMalloc(&e_bounds, 2 * sizeof(int32_t)), "e_bounds");
+        G::iota(e_ids, T * k, st);
+        ck(cudaMalloc(&exq, Q::q8_bytes((int64_t) T * k, E)), "exq");
+        ck(cudaMalloc(&exq2, Q::q8_bytes((int64_t) T * k, M.n_ff_exp)), "exq2");
+    }
+    void gm(const Ten& w, const void* wd, size_t wbytes, int64_t n_in, int64_t n_out, const float* xin, int64_t ld_x,
+           int T, float* y, int64_t ld_y) {
+        gemm->run(w.type, wd, n_in, n_out, wbytes, xin, ld_x, T, y, ld_y, st);
+    }
+    void gm(const Ten& w, const float* xin, int T, float* y) {
+        gm(w, w.d, w.bytes, (int64_t) w.shape[0], (int64_t) w.shape[1], xin, (int64_t) w.shape[0], T, y,
+          (int64_t) w.shape[1]);
+    }
+    void hc_read_b(const Ten& fn, const Ten& base, const Ten& scale, int T) {
+        const int E = M.n_embd;
+        G::rms_norm_rows(bR, nullptr, bflat, T, G::kHc * E, M.eps_rms, st);
+        gm(fn, bflat, T, bmix);
+        G::hc_read_rows(bmix, scale.f(), base.f(), bR, bx, bpost, bcomb, E, M.hc_eps, M.hc_iters, T, st);
+    }
+    void kda_b(int il, int T) {
+        const auto& L = M.layers[il];
+        const int HD = M.n_head * M.head_dim, kc1 = M.d_conv - 1;
+        float* cs = conv[il];
+        gm(L.q, bh, T, bqp);
+        gm(L.k, bh, T, bkp);
+        gm(L.v, bh, T, bvp);
+        G::kda_conv_silu_seq(bqp, cs, L.cq.f(), bqp, HD, M.d_conv, T, st);   // in place: each value read once first
+        G::kda_conv_silu_seq(bkp, cs + (size_t) kc1 * HD, L.ck.f(), bkp, HD, M.d_conv, T, st);
+        G::kda_conv_silu_seq(bvp, cs + (size_t) 2 * kc1 * HD, L.cv.f(), bvp, HD, M.d_conv, T, st);
+        gm(L.fa, bh, T, bfa);
+        gm(L.fb, bfa, T, bgf);
+        G::kda_gate_rows(bgf, L.dtb.f(), L.A.f(), bg, M.n_head, M.head_dim, T, M.gate_lower, st);
+        gm(L.beta, bh, T, bbeta);
+        G::sigmoid_inplace(bbeta, T * M.n_head, st);
+        G::l2_norm_rows(bqp, T * M.n_head, M.head_dim, 1e-6f, st);
+        G::l2_norm_rows(bkp, T * M.n_head, M.head_dim, 1e-6f, st);
+        G::kda_scan(S[il], bqp, bkp, bvp, bg, bbeta, bo, M.n_head, M.head_dim, T, st);
+        gm(L.ga, bh, T, bga);
+        gm(L.gb, bga, T, bg2);
+        G::kda_out_gate(bo, L.onorm.f(), bg2, bgated, T * M.n_head, M.head_dim, M.eps_rms, st);
+        gm(L.wo, bgated, T, bout);
+    }
+    void mla_b(int il, int T) {
+        const auto& L = M.layers[il];
+        const int H = M.n_head;
+        const int64_t p0 = pos;
+        if ((p0 + T) / M.kpool > M.ix_topk / M.kpool)
+            throw std::runtime_error("contexts past " + std::to_string(M.ix_topk) +
+                                     " tokens need the indexer's top-k selection (not implemented yet)");
+        gm(L.qa, bh, T, bqa);
+        G::rms_norm_rows(bqa, L.qa_norm.f(), bqr, T, M.q_lora, M.eps_rms, st);
+        gm(L.qb, bqr, T, bq);
+        gm(L.kva, bh, T, blat);
+        G::rms_norm_rows(blat, L.kva_norm.f(), lat_cache[il] + (size_t) p0 * M.kv_lora, T, M.kv_lora, M.eps_rms, st);
+        const size_t kb_head = L.kb.bytes / H, vb_head = L.vb.bytes / H;
+        for (int hh = 0; hh < H; ++hh)
+            gm(L.kb, (const uint8_t*) L.kb.d + hh * kb_head, kb_head, M.dk_mla, M.kv_lora, bq + (size_t) hh * M.dk_mla,
+              (int64_t) H * M.dk_mla, T, bqabs + (size_t) hh * M.kv_lora, (int64_t) H * M.kv_lora);
+        gm(L.ix_k, bh, T, bik);
+        G::layer_norm_rows(bik, L.ix_knw.f(), L.ix_knb.f(), ik_cache[il] + (size_t) p0 * M.ix_dim, T, M.ix_dim, M.eps_ln, st);
+        gm(L.ix_gate, bh, T, ig_cache[il] + (size_t) p0 * M.ix_dim);
+        G::kpool_keys(ik_cache[il], ig_cache[il], L.ix_ape.f(), pool_cache[il], p0 / M.kpool,
+                      (int) ((p0 + T) / M.kpool - p0 / M.kpool), M.kpool, M.ix_dim, st);
+        G::mla_attend_rows(bqabs, lat_cache[il], p0, T, H, M.kv_lora, M.kpool, 1.0f / std::sqrt((float) M.dk_mla), bolat, st);
+        for (int hh = 0; hh < H; ++hh)
+            gm(L.vb, (const uint8_t*) L.vb.d + hh * vb_head, vb_head, M.kv_lora, M.dv_mla, bolat + (size_t) hh * M.kv_lora,
+              (int64_t) H * M.kv_lora, T, bvh + (size_t) hh * M.dv_mla, (int64_t) H * M.dv_mla);
+        gm(L.wo, bvh, T, bout);
+    }
+    void expert_product(int type, const void* w, int64_t n_in, int64_t n_out, size_t wbytes, const void* xq_, int rows,
+                        float* dst) {
+        Q::Product p;
+        p.w = w; p.type = type; p.w_rows = n_out; p.w_cols = n_in; p.expert_bytes = wbytes; p.n = 1;
+        p.xq = xq_; p.bounds = e_bounds; p.ids = e_ids; p.total_rows = rows; p.max_rows = rows;
+        p.dst = dst; p.ld_dst = n_out;
+        gemm->ctx.run(p, st);
+    }
+    void moe_b(int il, int T) {
+        const auto& L = M.layers[il];
+        const int E = M.n_embd, k = M.n_used, F = M.n_ff_exp;
+        G::gemm_f32(L.router.f(), bh, blog, E, M.n_expert, T, st);
+        G::router_topk_rows(blog, L.probs_b.f(), M.n_expert, k, M.w_scale, bids, bw, T, st);
+        // shared expert for every token
+        gm(L.sg, bh, T, bsg);
+        gm(L.su, bh, T, bsu);
+        G::swiglu_clamp(bsg, bsu, bsg, T * F, M.clamp_sh[il], st);
+        gm(L.sd, bsg, T, bshared);
+        // routed: rows grouped by expert, each expert's weights copied to the GPU once for all its rows
+        std::vector<int32_t> ids((size_t) T * k);
+        ck(cudaMemcpyAsync(ids.data(), bids, ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, st), "ids");
+        ck(cudaStreamSynchronize(st), "ids sync");
+        std::vector<int32_t> count(M.n_expert + 1, 0), htok(ids.size()), hdst(ids.size());
+        for (int32_t e : ids) count[e + 1]++;
+        for (int e = 0; e < M.n_expert; ++e) count[e + 1] += count[e];
+        std::vector<int32_t> fill(count.begin(), count.end() - 1);
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < k; ++j) {
+                const int e = ids[(size_t) t * k + j];
+                const int r = fill[e]++;
+                htok[r] = t;
+                hdst[r] = t * k + j;
+            }
+        ck(cudaMemcpyAsync(rtok, htok.data(), htok.size() * sizeof(int32_t), cudaMemcpyHostToDevice, st), "rtok");
+        ck(cudaMemcpyAsync(rdst, hdst.data(), hdst.size() * sizeof(int32_t), cudaMemcpyHostToDevice, st), "rdst");
+        const size_t gbytes = L.eg.bytes / M.n_expert, dbytes = L.ed.bytes / M.n_expert;
+        for (int e = 0; e < M.n_expert; ++e) {
+            const int r0 = count[e], n = count[e + 1] - count[e];
+            if (n == 0) continue;
+            const auto c0 = std::chrono::steady_clock::now();
+            ck(cudaMemcpyAsync(stage_g, L.eg.host + (size_t) e * gbytes, gbytes, cudaMemcpyHostToDevice, st), "eg");
+            ck(cudaMemcpyAsync(stage_u, L.eu.host + (size_t) e * gbytes, gbytes, cudaMemcpyHostToDevice, st), "eu");
+            ck(cudaMemcpyAsync(stage_d, L.ed.host + (size_t) e * dbytes, dbytes, cudaMemcpyHostToDevice, st), "ed");
+            ms_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+            bytes_streamed += 2 * gbytes + dbytes;
+            G::set_pair(e_bounds, 0, n, st);
+            Q::quantize(bh, rtok + r0, exq, L.eg.type, E, E, n, st);
+            expert_product(L.eg.type, stage_g, E, F, gbytes, exq, n, bge);
+            expert_product(L.eu.type, stage_u, E, F, gbytes, exq, n, bue);
+            G::swiglu_clamp(bge, bue, bae, n * F, M.clamp_exp[il], st);
+            Q::quantize(bae, nullptr, exq2, L.ed.type, F, F, n, st);
+            expert_product(L.ed.type, stage_d, F, E, dbytes, exq2, n, bye);
+            G::scatter_scaled(bye, rdst + r0, rdst + r0, bw, bparts, n, E, st);
+        }
+        G::sum_parts(bparts, bshared, bout, T, k, E, st);
+    }
+    // T prompt tokens at positions pos.. through every layer; the logits of the last one into `logits`.
+    void prefill(const int32_t* toks, int T) {
+        if (T > Tmax) throw std::runtime_error("prefill: chunk larger than the buffers");
+        if (pos + T > ctx) throw std::runtime_error("context full");
+        const int E = M.n_embd;
+        std::vector<float> emb((size_t) T * G::kHc * E);
+        const size_t row = M.tok_embd.bytes / M.n_vocab;
+        for (int t = 0; t < T; ++t) {
+            const uint8_t* r = M.tok_embd.host + (size_t) toks[t] * row;
+            float* e0 = emb.data() + (size_t) t * G::kHc * E;
+            for (int b = 0; b < E / 256; ++b) strata::dequantize_q4_K(r + (size_t) b * 144, e0 + b * 256);
+            for (int s = 1; s < G::kHc; ++s) std::memcpy(e0 + (size_t) s * E, e0, E * sizeof(float));
+        }
+        ck(cudaMemcpyAsync(bR, emb.data(), emb.size() * sizeof(float), cudaMemcpyHostToDevice, st), "emb");
+        for (int il = 0; il < M.n_layer; ++il) {
+            const auto& L = M.layers[il];
+            hc_read_b(L.hca_fn, L.hca_base, L.hca_scale, T);
+            G::rms_norm_rows(bx, L.attn_norm.f(), bh, T, E, M.eps_rms, st);
+            if (L.mla) mla_b(il, T); else kda_b(il, T);
+            G::hc_write_rows(bout, bR, bpost, bcomb, bR, E, T, st);
+            hc_read_b(L.hcf_fn, L.hcf_base, L.hcf_scale, T);
+            G::rms_norm_rows(bx, L.ffn_norm.f(), bh, T, E, M.eps_rms, st);
+            if (L.moe) {
+                moe_b(il, T);
+            } else {
+                gm(L.fg, bh, T, bfg);
+                gm(L.fu, bh, T, bfu);
+                G::swiglu_clamp(bfg, bfu, bfg, T * M.n_ff, M.clamp_sh[il], st);
+                gm(L.fd, bfg, T, bout);
+            }
+            G::hc_write_rows(bout, bR, bpost, bcomb, bR, E, T, st);
+        }
+        // the head for the last token
+        G::hc_mean(bR + (size_t) (T - 1) * G::kHc * E, x, E, st);
+        G::rms_norm_rows(x, M.output_norm.f(), h, 1, E, M.eps_rms, st);
+        mm(M.output, h, logits);
+        pos += T;
+    }
+
     explicit Engine(Model& m, int ctx_) : M(m), ctx(ctx_) {
         ck(cudaStreamCreate(&st), "stream");
         const int E = M.n_embd, HD = M.n_head * M.head_dim;
@@ -572,7 +773,7 @@ std::vector<int32_t> parse_ids(const std::string& s) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::string model, tokens;
-    int max_new = 8, ctx = 4096, top = 5;
+    int max_new = 8, ctx = 4096, top = 5, chunk = 0;
     bool dump = false, self = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -585,6 +786,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-new") max_new = std::stoi(next());
         else if (a == "--ctx") ctx = std::stoi(next());
         else if (a == "--top") top = std::stoi(next());
+        else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--dump") dump = true;
         else if (a == "--selftest") self = true;
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); return 2; }
@@ -622,7 +824,13 @@ int main(int argc, char** argv) {
             return idx[0];
         };
         const auto tp = clk::now();
-        for (size_t i = 0; i < prompt.size(); ++i) E.forward(prompt[i], i + 1 == prompt.size());
+        if (chunk > 0) {
+            E.alloc_batch(chunk);
+            for (size_t i = 0; i < prompt.size(); i += chunk)
+                E.prefill(prompt.data() + i, (int) std::min<size_t>(chunk, prompt.size() - i));
+        } else {
+            for (size_t i = 0; i < prompt.size(); ++i) E.forward(prompt[i], i + 1 == prompt.size());
+        }
         ck(cudaStreamSynchronize(E.st), "prompt");
         const double prompt_s = std::chrono::duration<double>(clk::now() - tp).count();
         std::vector<int32_t> outv;
@@ -639,6 +847,9 @@ int main(int argc, char** argv) {
         for (int32_t t : outv) std::printf(" %d", t);
         std::printf("\nprompt %zu tokens in %.2f s (%.2f tok/s); decode %d tokens in %.2f s (%.2f tok/s)\n", prompt.size(),
                     prompt_s, prompt.size() / prompt_s, max_new - 1, dec_s, (max_new - 1) / std::max(dec_s, 1e-9));
+        if (chunk > 0)
+            std::printf("prompt path: %.2f GB of experts copied to the GPU (host time in copy calls %.0f ms)\n",
+                        E.bytes_streamed / 1e9, E.ms_copy);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-glm: %s\n", e.what());
         return 1;

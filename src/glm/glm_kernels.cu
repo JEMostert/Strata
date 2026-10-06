@@ -356,6 +356,277 @@ __global__ void argmax_kernel(const float* x, int n, int32_t* out) {
     if (threadIdx.x == 0) *out = bi[0];
 }
 
+
+__global__ void hc_read_rows_kernel(const float* mixes, const float* scale, const float* base, const float* R,
+                                    float* x_out, float* post_out, float* comb_out, int n_embd, float eps, int iters) {
+    const int t = blockIdx.x;
+    mixes += (size_t) t * kHcMix;
+    R += (size_t) t * kHc * n_embd;
+    x_out += (size_t) t * n_embd;
+    post_out += (size_t) t * kHc;
+    comb_out += (size_t) t * kHc * kHc;
+    __shared__ float pre[kHc];
+    if (threadIdx.x == 0) {
+        float post[kHc], c[kHc][kHc];
+        for (int h = 0; h < kHc; ++h) {
+            pre[h] = sigmoidf_(mixes[h] * scale[0] + base[h]) + eps;
+            post[h] = 2.0f * sigmoidf_(mixes[kHc + h] * scale[1] + base[kHc + h]);
+        }
+        for (int s = 0; s < kHc; ++s)
+            for (int d = 0; d < kHc; ++d) {
+                const int r = d + kHc * s;
+                c[d][s] = mixes[2 * kHc + r] * scale[2] + base[2 * kHc + r];
+            }
+        for (int s = 0; s < kHc; ++s) {
+            float m = c[0][s];
+            for (int d = 1; d < kHc; ++d) m = fmaxf(m, c[d][s]);
+            float sum = 0.0f;
+            for (int d = 0; d < kHc; ++d) { c[d][s] = expf(c[d][s] - m); sum += c[d][s]; }
+            for (int d = 0; d < kHc; ++d) c[d][s] = c[d][s] / sum + eps;
+        }
+        for (int it = 0; it < iters; ++it) {
+            if (it > 0)
+                for (int s = 0; s < kHc; ++s) {
+                    float sum = 0.0f;
+                    for (int d = 0; d < kHc; ++d) sum += c[d][s];
+                    sum += eps;
+                    for (int d = 0; d < kHc; ++d) c[d][s] /= sum;
+                }
+            for (int d = 0; d < kHc; ++d) {
+                float sum = 0.0f;
+                for (int s = 0; s < kHc; ++s) sum += c[d][s];
+                sum += eps;
+                for (int s = 0; s < kHc; ++s) c[d][s] /= sum;
+            }
+        }
+        for (int h = 0; h < kHc; ++h) post_out[h] = post[h];
+        for (int d = 0; d < kHc; ++d)
+            for (int s = 0; s < kHc; ++s) comb_out[d + kHc * s] = c[d][s];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        float acc = R[i] * pre[0];
+        for (int h = 1; h < kHc; ++h) acc += R[(size_t) h * n_embd + i] * pre[h];
+        x_out[i] = acc;
+    }
+}
+
+__global__ void hc_write_rows_kernel(const float* f, const float* R_in, const float* post, const float* comb,
+                                     float* R_out, int n_embd) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_embd) return;
+    const float* Ri = R_in + (size_t) t * kHc * n_embd;
+    float* Ro = R_out + (size_t) t * kHc * n_embd;
+    const float* pt = post + (size_t) t * kHc;
+    const float* ct = comb + (size_t) t * kHc * kHc;
+    float r[kHc];
+    for (int s = 0; s < kHc; ++s) r[s] = Ri[(size_t) s * n_embd + i];
+    const float x = f[(size_t) t * n_embd + i];
+    for (int d = 0; d < kHc; ++d) {
+        float acc = x * pt[d];
+        for (int s = 0; s < kHc; ++s) acc += r[s] * ct[d + kHc * s];
+        Ro[(size_t) d * n_embd + i] = acc;
+    }
+}
+
+__global__ void kda_conv_silu_seq_kernel(const float* x, float* state, const float* w, float* y, int channels, int k,
+                                         int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float win[8];
+    float* st = state + (size_t) c * (k - 1);
+    for (int j = 0; j < k - 1; ++j) win[j] = st[j];
+    const float* wc = w + (size_t) c * k;
+    for (int t = 0; t < T; ++t) {
+        const float xv = x[(size_t) t * channels + c];
+        float acc = 0.0f;
+        for (int j = 0; j < k - 1; ++j) acc += win[j] * wc[j];
+        acc += xv * wc[k - 1];
+        for (int j = 0; j < k - 2; ++j) win[j] = win[j + 1];
+        win[k - 2] = xv;
+        y[(size_t) t * channels + c] = acc / (1.0f + expf(-acc));
+    }
+    for (int j = 0; j < k - 1; ++j) st[j] = win[j];
+}
+
+__global__ void kda_gate_rows_kernel(const float* gf, const float* dt_bias, const float* A, float* g, int64_t n,
+                                     int row, int head_dim, float lower) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = (int) (i % row);
+    const float t = (gf[i] + dt_bias[c]) * A[c / head_dim];
+    g[i] = sigmoidf_(-t) * lower;
+}
+
+__global__ void kda_scan_kernel(float* S, const float* q, const float* k, const float* v, const float* g,
+                                const float* beta, float* out, int n_head, int d, int T) {
+    const int h = blockIdx.x, j = threadIdx.x;
+    extern __shared__ float sh[];
+    float* eg = sh;
+    float* kk = sh + d;
+    float* qq = sh + 2 * d;
+    float* row = S + ((size_t) h * d + j) * d;
+    const float inv = 1.0f / sqrtf((float) d);
+    for (int t = 0; t < T; ++t) {
+        const size_t base = ((size_t) t * n_head + h) * d;
+        __syncthreads();
+        for (int i = threadIdx.x; i < d; i += blockDim.x) {
+            eg[i] = expf(g[base + i]);
+            kk[i] = k[base + i];
+            qq[i] = q[base + i];
+        }
+        __syncthreads();
+        if (j < d) {
+            float sum = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                const float s = row[i] * eg[i];
+                row[i] = s;
+                sum += s * kk[i];
+            }
+            const float delta = (v[base + j] - sum) * beta[(size_t) t * n_head + h];
+            float o = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                const float s = row[i] + kk[i] * delta;
+                row[i] = s;
+                o += s * qq[i];
+            }
+            out[base + j] = o * inv;
+        }
+    }
+}
+
+__global__ void layer_norm_rows_kernel(const float* x, const float* w, const float* b, float* y, int n, float eps) {
+    x += (size_t) blockIdx.x * n;
+    y += (size_t) blockIdx.x * n;
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i];
+    const float mean = block_sum(s) / (float) n;
+    float v = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { const float d = x[i] - mean; v += d * d; }
+    const float sc = 1.0f / sqrtf(block_sum(v) / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = (x[i] - mean) * sc * w[i] + b[i];
+}
+
+// MQA over the latent cache: block = 8 heads (one warp each) of one query token; the latents are read once per
+// block in tiles through shared memory, online softmax per head, lane-held accumulators (lat / 32 per lane).
+template <int LAT>
+__global__ void mla_attend_rows_kernel(const float* q_abs, const float* cache, int64_t p0, int n_head, int kpool,
+                                       float scale, float* out) {
+    constexpr int TILE = 16, PER = LAT / 32;
+    __shared__ float tile[TILE][LAT];
+    const int t = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = blockIdx.x * 8 + warp;
+    const int64_t n_vis = ((p0 + t + 1) / kpool) * kpool;
+    float q[PER], acc[PER];
+    const float* qh = q_abs + ((size_t) t * n_head + h) * LAT;
+    for (int i = 0; i < PER; ++i) { q[i] = qh[lane + 32 * i]; acc[i] = 0.0f; }
+    float m = -FLT_MAX, z = 0.0f;
+    for (int64_t t0 = 0; t0 < n_vis; t0 += TILE) {
+        const int nt = (int) min((int64_t) TILE, n_vis - t0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < nt * LAT; i += blockDim.x)
+            tile[i / LAT][i % LAT] = cache[(size_t) (t0 + i / LAT) * LAT + i % LAT];
+        __syncthreads();
+        float sc[TILE];
+        float tmax = -FLT_MAX;
+        for (int l = 0; l < nt; ++l) {
+            float s = 0.0f;
+            for (int i = 0; i < PER; ++i) s += q[i] * tile[l][lane + 32 * i];
+            s = warp_sum(s) * scale;
+            sc[l] = s;
+            tmax = fmaxf(tmax, s);
+        }
+        const float mn = fmaxf(m, tmax);
+        const float corr = expf(m - mn);
+        z *= corr;
+        for (int i = 0; i < PER; ++i) acc[i] *= corr;
+        for (int l = 0; l < nt; ++l) {
+            const float p = expf(sc[l] - mn);
+            z += p;
+            for (int i = 0; i < PER; ++i) acc[i] += p * tile[l][lane + 32 * i];
+        }
+        m = mn;
+    }
+    float* oh = out + ((size_t) t * n_head + h) * LAT;
+    const float inv = n_vis > 0 ? 1.0f / z : 0.0f;
+    for (int i = 0; i < PER; ++i) oh[lane + 32 * i] = acc[i] * inv;
+}
+
+__global__ void kpool_keys_kernel(const float* key_cache, const float* gate_cache, const float* ape, float* pooled,
+                                  int64_t pool0, int kpool, int dim) {
+    const int64_t pool = pool0 + blockIdx.y;
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+    const float* key = key_cache + (size_t) pool * kpool * dim;
+    const float* gate = gate_cache + (size_t) pool * kpool * dim;
+    float m = -FLT_MAX;
+    for (int j = 0; j < kpool; ++j) m = fmaxf(m, gate[(size_t) j * dim + d] + ape[(size_t) j * dim + d]);
+    float z = 0.0f;
+    for (int j = 0; j < kpool; ++j) z += expf(gate[(size_t) j * dim + d] + ape[(size_t) j * dim + d] - m);
+    float acc = 0.0f;
+    for (int j = 0; j < kpool; ++j)
+        acc += expf(gate[(size_t) j * dim + d] + ape[(size_t) j * dim + d] - m) / z * key[(size_t) j * dim + d];
+    pooled[(size_t) pool * dim + d] = acc;
+}
+
+__global__ void gemm_f32_kernel(const float* W, const float* x, float* y, int n_in, int n_out, int T) {
+    const int64_t gw = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (gw >= (int64_t) n_out * T) return;
+    const int row = (int) (gw % n_out), t = (int) (gw / n_out);
+    const float* w = W + (size_t) row * n_in;
+    const float* xt = x + (size_t) t * n_in;
+    float s = 0.0f;
+    for (int i = lane; i < n_in; i += 32) s += w[i] * xt[i];
+    s = warp_sum(s);
+    if (lane == 0) y[(size_t) t * n_out + row] = s;
+}
+
+__global__ void router_topk_rows_kernel(const float* logits, const float* bias, int n_expert, int k, float scale,
+                                        int32_t* ids, float* weights, int T) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const float* lg = logits + (size_t) t * n_expert;
+    int32_t* id = ids + (size_t) t * k;
+    float* wt = weights + (size_t) t * k;
+    unsigned taken[16] = {0};
+    float sum = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        int best = -1;
+        float bv = -FLT_MAX;
+        for (int e = 0; e < n_expert; ++e) {
+            if (taken[e >> 5] & (1u << (e & 31))) continue;
+            const float v = sigmoidf_(lg[e]) + (bias ? bias[e] : 0.0f);
+            if (v > bv) { bv = v; best = e; }
+        }
+        taken[best >> 5] |= 1u << (best & 31);
+        id[j] = best;
+        wt[j] = sigmoidf_(lg[best]);
+        sum += wt[j];
+    }
+    sum = fmaxf(sum, 6.103515625e-5f);
+    for (int j = 0; j < k; ++j) wt[j] = wt[j] / sum * scale;
+}
+
+__global__ void scatter_scaled_kernel(const float* y, const int32_t* dst, const int32_t* wi, const float* w,
+                                      float* parts, int n) {
+    const int r = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    parts[(size_t) dst[r] * n + i] = w[wi[r]] * y[(size_t) r * n + i];
+}
+
+__global__ void sum_parts_kernel(const float* parts, const float* extra, float* out, int k, int n) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float* p = parts + (size_t) t * k * n;
+    float acc = p[i];
+    for (int j = 1; j < k; ++j) acc += p[(size_t) j * n + i];
+    out[(size_t) t * n + i] = acc + extra[(size_t) t * n + i];
+}
+
 __global__ void iota_kernel(int32_t* d, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) d[i] = i;
@@ -451,6 +722,79 @@ void axpy_dev(float* y, const float* x, const float* a_dev, int n, void* stream)
 void add_inplace(float* y, const float* x, int n, void* stream) {
     add_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(y, x, n);
     check("add_inplace");
+}
+
+void hc_read_rows(const float* mixes, const float* scale, const float* base, const float* R, float* x, float* post,
+                  float* comb, int n_embd, float eps, int iters, int T, void* stream) {
+    hc_read_rows_kernel<<<T, 512, 0, (cudaStream_t) stream>>>(mixes, scale, base, R, x, post, comb, n_embd, eps, iters);
+    check("hc_read_rows");
+}
+void hc_write_rows(const float* f, const float* R_in, const float* post, const float* comb, float* R_out, int n_embd,
+                   int T, void* stream) {
+    hc_write_rows_kernel<<<dim3(blocks(n_embd, 256), T), 256, 0, (cudaStream_t) stream>>>(f, R_in, post, comb, R_out,
+                                                                                         n_embd);
+    check("hc_write_rows");
+}
+void kda_conv_silu_seq(const float* x, float* state, const float* w, float* y, int channels, int k, int T,
+                       void* stream) {
+    if (k > 9) throw std::runtime_error("kda_conv_silu_seq: kernel width > 9");
+    kda_conv_silu_seq_kernel<<<blocks(channels, 128), 128, 0, (cudaStream_t) stream>>>(x, state, w, y, channels, k, T);
+    check("kda_conv_silu_seq");
+}
+void kda_gate_rows(const float* gf, const float* dt_bias, const float* A, float* g, int n_head, int head_dim, int T,
+                   float lower, void* stream) {
+    const int64_t n = (int64_t) T * n_head * head_dim;
+    kda_gate_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gf, dt_bias, A, g, n,
+                                                                                         n_head * head_dim, head_dim,
+                                                                                         lower);
+    check("kda_gate_rows");
+}
+void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* out,
+              int n_head, int head_dim, int T, void* stream) {
+    kda_scan_kernel<<<n_head, head_dim, 3 * head_dim * sizeof(float), (cudaStream_t) stream>>>(S, q, k, v, g, beta, out,
+                                                                                             n_head, head_dim, T);
+    check("kda_scan");
+}
+void layer_norm_rows(const float* x, const float* w, const float* b, float* y, int rows, int n, float eps,
+                     void* stream) {
+    layer_norm_rows_kernel<<<rows, 128, 0, (cudaStream_t) stream>>>(x, w, b, y, n, eps);
+    check("layer_norm_rows");
+}
+void mla_attend_rows(const float* q_abs, const float* cache, int64_t p0, int T, int n_head, int lat, int kpool,
+                     float scale, float* out, void* stream) {
+    if (lat != 512 || n_head % 8) throw std::runtime_error("mla_attend_rows: built for 512-wide latents, 8k heads");
+    mla_attend_rows_kernel<512><<<dim3(n_head / 8, T), 256, 0, (cudaStream_t) stream>>>(q_abs, cache, p0, n_head, kpool,
+                                                                                       scale, out);
+    check("mla_attend_rows");
+}
+void kpool_keys(const float* key_cache, const float* gate_cache, const float* ape, float* pooled, int64_t pool0, int n,
+                int kpool, int dim, void* stream) {
+    if (n <= 0) return;
+    kpool_keys_kernel<<<dim3(blocks(dim, 128), n), 128, 0, (cudaStream_t) stream>>>(key_cache, gate_cache, ape, pooled,
+                                                                                   pool0, kpool, dim);
+    check("kpool_keys");
+}
+void gemm_f32(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* stream) {
+    const int64_t warps = (int64_t) n_out * T;
+    gemm_f32_kernel<<<(unsigned) ((warps + 7) / 8), 256, 0, (cudaStream_t) stream>>>(W, x, y, n_in, n_out, T);
+    check("gemm_f32");
+}
+void router_topk_rows(const float* logits, const float* bias, int n_expert, int k, float scale, int32_t* ids,
+                      float* weights, int T, void* stream) {
+    if (n_expert > 512) throw std::runtime_error("router_topk_rows: at most 512 experts");
+    router_topk_rows_kernel<<<blocks(T, 64), 64, 0, (cudaStream_t) stream>>>(logits, bias, n_expert, k, scale, ids,
+                                                                              weights, T);
+    check("router_topk_rows");
+}
+void scatter_scaled(const float* y, const int32_t* dst, const int32_t* wi, const float* w, float* parts, int rows,
+                    int n, void* stream) {
+    if (rows <= 0) return;
+    scatter_scaled_kernel<<<dim3(blocks(n, 256), rows), 256, 0, (cudaStream_t) stream>>>(y, dst, wi, w, parts, n);
+    check("scatter_scaled");
+}
+void sum_parts(const float* parts, const float* extra, float* out, int T, int k, int n, void* stream) {
+    sum_parts_kernel<<<dim3(blocks(n, 256), T), 256, 0, (cudaStream_t) stream>>>(parts, extra, out, k, n);
+    check("sum_parts");
 }
 void iota(int32_t* d, int n, void* stream) {
     iota_kernel<<<blocks(n, 256), 256, 0, (cudaStream_t) stream>>>(d, n);
