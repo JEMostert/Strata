@@ -11,7 +11,6 @@
 // the group size therefore never changes an answer.
 //
 // The gain is the weight-side work and the weight bytes, read once per verify window instead of once per token.
-#include "strata/kernels/cpu/glu.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -246,7 +245,7 @@ void kq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
             dot_rows(type, blob + (size_t) r * gu_row, n, act + t0, m, g);
             dot_rows(type, blob + up_off + (size_t) r * gu_row, n, act + t0, m, u);
             // native_gu_rows' own SwiGLU expression: the same bits as the per-token ggml path
-            for (int t = 0; t < m; ++t) ff[t0 + t][r] = strata::kernels::cpu::swiglu(g[t], u[t]);
+            for (int t = 0; t < m; ++t) ff[t0 + t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
         }
     }
 }
